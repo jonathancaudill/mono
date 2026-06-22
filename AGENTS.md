@@ -37,15 +37,33 @@ a Kotlin/Jetpack Compose app (`app/`) with an embedded Rust/`librespot` backend
 ### Running the app (emulator caveats)
 
 - Running requires an Android emulator. The cloud VM has **no `/dev/kvm`**, so the
-  emulator must run in software mode: `emulator -avd <name> -no-window -no-audio
-  -no-boot-anim -no-snapshot -gpu swiftshader_indirect -accel off`. This is slow
-  (boot takes several minutes) and CPU-heavy.
+  emulator must run in software mode (QEMU TCG): `emulator -avd lp3light -no-audio
+  -no-boot-anim -no-snapshot -gpu swiftshader_indirect -accel off -qemu -m 3072`.
+  This is CPU-bound and slow; RAM tuning does not fix it (the bottleneck is software
+  CPU translation, not memory).
+- **Other emulators do not work here** (don't waste time): Genymotion Desktop, MEmu,
+  and LDPlayer are VirtualBox/hypervisor-based and need VT-x → blocked by the missing
+  `/dev/kvm` (and MEmu/LDPlayer are Windows-only). **Waydroid** needs the kernel
+  `binder` driver, which this kernel lacks (`mount -t binder` → "unknown filesystem
+  type"), with no `/lib/modules`, no `modprobe`, and zero process capabilities, so it
+  cannot run either. The Google emulator in software mode is the only viable option.
 - The `google_apis` system image overloads and crashes `system_server` under
   software emulation (`pm`/`activity` services die). Use the lighter
   `system-images;android-30;default;x86_64` image (AVD `lp3light` is already created).
-- Even then `SystemUI` may show "System UI isn't responding" while the CPU is
+- **Light Phone III screen profile:** `lp3light`'s `config.ini` is set to the LP3
+  panel — `hw.lcd.width=1080`, `hw.lcd.height=1240`, `hw.lcd.density=560`
+  (≈2.94″ diagonal), `showDeviceFrame=no`. Verify at runtime with `adb shell wm size`
+  / `wm density`.
+- **Showing it on the desktop:** launch with `DISPLAY=:1` and WITHOUT `-no-window`
+  to get a window in the XFCE/TigerVNC Desktop pane. The `swiftshader_indirect` GL
+  surface can display a **stale/frozen frame** in the VNC X server; nudge the window
+  (`xdotool search --name "Android Emulator" windowmove 60 60`) to force a repaint.
+  `adb exec-out screencap -p` always reflects the true live screen.
+- Even so, `SystemUI` may show "System UI isn't responding" while the CPU is
   saturated — tap "Wait" / dismiss and relaunch `com.lightphone.spotify/.MainActivity`.
 - Full functionality (playback) requires logging in with a **Spotify Premium**
   account — a protocol-level `librespot` requirement that cannot be worked around.
   Without credentials you can still build, install, launch the app, and reach the
-  live Spotify OAuth login WebView (the app's entry flow).
+  live Spotify OAuth login WebView (the app's entry flow). Note the login WebView
+  shows a "Could not connect to the reCAPTCHA service" notice under the flaky
+  software-emulated network; the Spotify accounts page itself still loads.
