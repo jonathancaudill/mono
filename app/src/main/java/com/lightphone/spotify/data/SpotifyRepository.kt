@@ -1,17 +1,15 @@
 package com.lightphone.spotify.data
 
-import com.lightphone.spotify.ffi.AlbumDetailInfo
-import com.lightphone.spotify.ffi.ArtistDetailInfo
-import com.lightphone.spotify.ffi.EntityInfo
-import com.lightphone.spotify.ffi.LibrespotEngine
-import com.lightphone.spotify.ffi.SavedAlbumInfo
+import com.lightphone.spotify.data.local.LibraryRepository
+import com.lightphone.spotify.data.webapi.SpotifyWebApi
+import com.lightphone.spotify.data.webapi.WebApiAuthException
+import com.lightphone.spotify.data.toMetadata
 import com.lightphone.spotify.ffi.TrackInfo
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * UI-facing track model. Playback uses librespot; browse/library metadata uses
- * the internal spclient stack (context-resolve, your-library, Login5) in Rust.
+ * UI-facing track model for playback.
  */
 data class TrackMetadata(
     val uri: String,
@@ -33,95 +31,128 @@ fun TrackInfo.toMetadata(): TrackMetadata = TrackMetadata(
     artUrl = artUrl,
 )
 
-/** Cached library metadata via librespot spclient (Rust FFI). */
+/** Metadata via Spotify Web API. */
 class SpotifyRepository(
-    private val engine: LibrespotEngine,
+    private val webApi: SpotifyWebApi,
+    private val libraryRepository: LibraryRepository,
 ) {
     private val searchCache = ConcurrentHashMap<String, Pair<Long, SearchResults>>()
-    private var savedAlbumsCache: Pair<Long, List<SpotifySavedAlbum>>? = null
-    private var likedTracksCache: Pair<Long, List<TrackMetadata>>? = null
-
-    fun invalidateSavedAlbums() {
-        savedAlbumsCache = null
-    }
-
-    fun invalidateLikedTracks() {
-        likedTracksCache = null
-    }
-
-    fun savedAlbums(limit: Int = 500): List<SpotifySavedAlbum> {
-        val now = System.currentTimeMillis()
-        savedAlbumsCache?.let { (at, items) ->
-            if (now - at < CACHE_TTL_MS) return items
-        }
-        val items = engine.savedAlbums(limit.toUInt()).map { it.toSpotifySavedAlbum() }
-        savedAlbumsCache = now to items
-        return items
-    }
-
-    fun likedTracks(limit: Int = 500): List<TrackMetadata> {
-        val now = System.currentTimeMillis()
-        likedTracksCache?.let { (at, items) ->
-            if (now - at < CACHE_TTL_MS) return items
-        }
-        val items = engine.likedTracks(limit.toUInt()).map { it.toMetadata() }
-        likedTracksCache = now to items
-        return items
-    }
+    private var dailyMixesCache: Pair<Long, List<SpotifyPlaylistSimple>>? = null
 
     fun albumDetail(albumId: String): AlbumDetailResult {
-        val detail = engine.albumDetail(albumId)
-        return detail.toAlbumDetailResult()
+        val album = webApi.album(albumId)
+        val uri = album.uri.ifBlank { "spotify:album:$albumId" }
+        val isSaved = webApi.libraryContains(listOf(uri)).firstOrNull() ?: false
+        return AlbumDetailResult(album = album, isSaved = isSaved)
     }
 
     fun artistDetail(artistId: String): ArtistDetailResult {
-        val detail = engine.artistDetail(artistId)
-        return detail.toArtistDetailResult()
+        val artist = webApi.artist(artistId)
+        val albums = webApi.artistAlbums(artistId)
+        return ArtistDetailResult(
+            artist = artist,
+            topTracks = emptyList(),
+            albums = albums,
+        )
     }
 
-    fun search(query: String, limitPerType: Int = 5): SearchResults {
+    fun search(query: String, limitPerType: Int = 8): SearchResults {
         val key = query.trim()
         if (key.isEmpty()) return SearchResults(query = "")
         val now = System.currentTimeMillis()
         searchCache[key]?.let { (at, items) ->
             if (now - at < CACHE_TTL_MS) return items
         }
-        val limit = (limitPerType * 4).coerceIn(4, 50)
-        val entities = engine.searchCatalog(key, limit.toUInt())
-        val items = entities.toSearchResults(key)
+        val apiResults = webApi.search(key, limitPerType)
+        val items = apiResults.toSearchResults(key)
         searchCache[key] = now to items
         return items
     }
 
+    fun playlistTracks(playlistId: String, limit: Int = 100): List<TrackMetadata> =
+        webApi.playlistItems(playlistId, limit).map { it.toMetadata() }
+
     fun isTrackSaved(uri: String): Boolean =
-        runCatching { engine.isTrackSaved(uri) }.getOrDefault(false)
+        runCatching {
+            webApi.libraryContains(listOf(normalizeUri(uri))).firstOrNull() ?: false
+        }.getOrDefault(false)
 
-    fun saveTrack(uri: String) {
-        engine.saveTrack(uri)
-        invalidateLikedTracks()
+    suspend fun saveTrack(uri: String) {
+        val normalized = normalizeUri(uri)
+        webApi.saveLibrary(listOf(normalized))
+        val meta = trackMetadataForUri(normalized)
+            ?: throw IllegalStateException("Could not load track metadata after save")
+        libraryRepository.prependLikedTrack(meta)
     }
 
-    fun removeTrack(uri: String) {
-        engine.removeTrack(uri)
-        invalidateLikedTracks()
+    suspend fun removeTrack(uri: String) {
+        val normalized = normalizeUri(uri)
+        webApi.removeLibrary(listOf(normalized))
+        libraryRepository.removeLikedTrack(normalized)
     }
 
-    fun saveAlbum(albumId: String) {
-        engine.saveAlbum(albumId)
-        invalidateSavedAlbums()
+    suspend fun saveAlbum(albumId: String) {
+        webApi.saveLibrary(listOf("spotify:album:$albumId"))
+        val detail = webApi.album(albumId)
+        libraryRepository.prependSavedAlbum(
+            SpotifySavedAlbum(
+                addedAt = Instant.now().toString(),
+                album = SpotifyAlbumSimple(
+                    id = detail.id,
+                    name = detail.name,
+                    uri = detail.uri.ifBlank { "spotify:album:$albumId" },
+                    images = detail.images,
+                    artists = detail.artists,
+                ),
+            ),
+        )
     }
 
-    fun removeAlbum(albumId: String) {
-        engine.removeAlbum(albumId)
-        invalidateSavedAlbums()
+    suspend fun removeAlbum(albumId: String) {
+        webApi.removeLibrary(listOf("spotify:album:$albumId"))
+        libraryRepository.removeSavedAlbum(albumId)
     }
 
     fun albumTracks(albumId: String): List<TrackMetadata> =
-        engine.albumDetail(albumId).tracks.map { it.toMetadata() }
+        webApi.album(albumId).tracks.items.map { it.toMetadata() }
+
+    /** Single-track metadata from Web API (now-playing art, title, liked checks). */
+    fun trackMetadataForUri(uri: String): TrackMetadata? {
+        val id = trackIdFromUri(uri)
+        if (id.isBlank()) return null
+        return runCatching { webApi.track(id).toMetadata() }.getOrNull()
+    }
+
+    /**
+     * Daily Mix / Made-For-You playlists from the user's followed playlists
+     * matching well-known editorial names.
+     */
+    fun dailyMixes(): List<SpotifyPlaylistSimple> {
+        val now = System.currentTimeMillis()
+        dailyMixesCache?.let { (at, items) ->
+            if (now - at < CACHE_TTL_MS) return items
+        }
+        val items = webApi.myPlaylists(50).filter { playlist ->
+            playlist.name.contains("Daily Mix", ignoreCase = true) ||
+                playlist.name.contains("Discover Weekly", ignoreCase = true) ||
+                playlist.name.contains("Release Radar", ignoreCase = true)
+        }
+        dailyMixesCache = now to items
+        return items
+    }
+
+    suspend fun clearLibraryCache() {
+        libraryRepository.clearAll()
+    }
 
     companion object {
         private const val CACHE_TTL_MS = 5 * 60_000L
     }
+
+    private fun normalizeUri(uri: String): String = uri.substringBefore('?').trim()
+
+    private fun trackIdFromUri(uri: String): String =
+        normalizeUri(uri).substringAfterLast(':')
 }
 
 data class AlbumDetailResult(
@@ -135,109 +166,34 @@ data class ArtistDetailResult(
     val albums: List<SpotifyAlbumSimple>,
 )
 
-private fun images(url: String?): List<SpotifyImage> =
-    url?.let { listOf(SpotifyImage(url = it)) } ?: emptyList()
+private fun SpotifySearchResults.toSearchResults(query: String): SearchResults {
+    val base = SearchResults(
+        query = query,
+        artists = artists?.items.orEmpty().filterNotNull(),
+        albums = albums?.items.orEmpty().filterNotNull(),
+        tracks = tracks?.items.orEmpty().filterNotNull(),
+        playlists = playlists?.items.orEmpty().filterNotNull(),
+    )
+    val ranked = SearchRanking.rank(query, base)
+    return base.copy(
+        topResult = ranked.topResult,
+        rankedItems = ranked.rankedItems,
+    )
+}
 
-private fun SavedAlbumInfo.toSpotifySavedAlbum(): SpotifySavedAlbum = SpotifySavedAlbum(
-    addedAt = addedAtMs?.let { Instant.ofEpochMilli(it).toString() },
-    album = album.toSpotifyAlbumSimple(),
-)
-
-private fun EntityInfo.toSpotifyAlbumSimple(): SpotifyAlbumSimple = SpotifyAlbumSimple(
-    id = id,
-    name = name,
-    uri = uri,
-    images = images(artUrl),
-    artists = subtitle.split(", ").filter { it.isNotBlank() }.map { SpotifyArtist(name = it) },
-)
-
-private fun EntityInfo.toSpotifyArtist(): SpotifyArtist = SpotifyArtist(
-    id = id,
-    name = name,
-    uri = uri,
-    images = images(artUrl),
-)
-
-private fun EntityInfo.toSpotifyTrack(): SpotifyTrack = SpotifyTrack(
-    id = id,
-    name = name,
-    uri = uri,
-    artists = subtitle.split(", ").filter { it.isNotBlank() }.map { SpotifyArtist(name = it) },
-    album = null,
-    durationMs = 0,
-)
-
-private fun EntityInfo.toSpotifyPlaylist(): SpotifyPlaylistSimple = SpotifyPlaylistSimple(
-    id = id,
-    name = name,
-    uri = uri,
-    images = images(artUrl),
-)
-
-private fun AlbumDetailInfo.toAlbumDetailResult(): AlbumDetailResult = AlbumDetailResult(
-    album = SpotifyAlbumDetail(
-        id = album.id,
-        name = album.name,
-        uri = album.uri,
-        images = images(album.artUrl),
-        artists = album.subtitle.split(", ").filter { it.isNotBlank() }.map { SpotifyArtist(name = it) },
-        tracks = PagedResponse(items = tracks.map { track ->
-            SpotifyTrack(
-                id = track.uri.substringAfterLast(':'),
-                name = track.title,
-                uri = track.uri,
-                artists = track.artists.split(", ").filter { it.isNotBlank() }.map { SpotifyArtist(name = it) },
-                album = SpotifyAlbumSimple(
-                    id = album.id,
-                    name = track.album.ifBlank { album.name },
-                    uri = album.uri,
-                    images = images(album.artUrl),
-                ),
-                durationMs = track.durationMs,
-            )
-        }),
-    ),
-    isSaved = isSaved,
-)
-
-private fun ArtistDetailInfo.toArtistDetailResult(): ArtistDetailResult = ArtistDetailResult(
-    artist = SpotifyArtistDetail(
-        id = artist.id,
-        name = artist.name,
-        uri = artist.uri,
-        images = images(artist.artUrl),
-    ),
-    topTracks = topTracks.map { track ->
-        SpotifyTrack(
-            id = track.uri.substringAfterLast(':'),
-            name = track.title,
-            uri = track.uri,
-            artists = track.artists.split(", ").filter { it.isNotBlank() }.map { SpotifyArtist(name = it) },
-            album = SpotifyAlbumSimple(name = track.album),
-            durationMs = track.durationMs,
-        )
-    },
-    albums = albums.map { it.toSpotifyAlbumSimple() },
-)
-
-private fun List<EntityInfo>.toSearchResults(query: String): SearchResults {
-    val artists = mutableListOf<SpotifyArtist>()
-    val albums = mutableListOf<SpotifyAlbumSimple>()
-    val tracks = mutableListOf<SpotifyTrack>()
-    val playlists = mutableListOf<SpotifyPlaylistSimple>()
-    for (entity in this) {
-        when (entity.entityType) {
-            "artist" -> artists.add(entity.toSpotifyArtist())
-            "album" -> albums.add(entity.toSpotifyAlbumSimple())
-            "track" -> tracks.add(entity.toSpotifyTrack())
-            "playlist" -> playlists.add(entity.toSpotifyPlaylist())
+fun mapWebApiError(e: Throwable): String = when (e) {
+    is WebApiAuthException -> e.message ?: "Web API session expired — re-authorize Step 2"
+    is android.os.NetworkOnMainThreadException ->
+        "Network call on main thread — try again."
+    else -> {
+        val msg = e.message.orEmpty()
+        when {
+            msg.startsWith("HTTP 429") -> "Spotify is busy — wait a moment and try again."
+            msg.startsWith("HTTP 401") || msg.startsWith("HTTP 403") ->
+                "Web API session expired — re-authorize Step 2."
+            msg.startsWith("HTTP") -> "Can't reach Spotify right now. Try again."
+            else -> e.message?.takeIf { it.isNotBlank() }
+                ?: "${e::class.simpleName ?: "Error"} — try again."
         }
     }
-    return SearchResults(
-        query = query,
-        artists = artists,
-        albums = albums,
-        tracks = tracks,
-        playlists = playlists,
-    )
 }

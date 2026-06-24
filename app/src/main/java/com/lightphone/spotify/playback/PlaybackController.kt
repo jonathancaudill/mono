@@ -14,12 +14,18 @@ import com.lightphone.spotify.NativeInit
 import com.lightphone.spotify.data.AlbumDetailResult
 import com.lightphone.spotify.data.ArtistDetailResult
 import com.lightphone.spotify.data.SearchResultItem
+import com.lightphone.spotify.data.mapWebApiError
+import com.lightphone.spotify.data.local.LibraryRepository
+import com.lightphone.spotify.data.local.LikedTrackEntity
+import com.lightphone.spotify.data.local.MonoDatabase
+import com.lightphone.spotify.data.local.SavedAlbumEntity
 import com.lightphone.spotify.data.SpotifyRepository
-import com.lightphone.spotify.data.SpotifySavedAlbum
 import com.lightphone.spotify.data.SearchResults
 import com.lightphone.spotify.data.TrackMetadata
 import com.lightphone.spotify.data.toMetadata
 import com.lightphone.spotify.ffi.LibrespotEngine
+import com.lightphone.spotify.data.webapi.SpotifyWebApi
+import com.lightphone.spotify.data.webapi.WebApiAuth
 import com.lightphone.spotify.ffi.NormalizationType
 import com.lightphone.spotify.ffi.PlayerEventListener
 import com.lightphone.spotify.ffi.SpotifyException
@@ -31,12 +37,14 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import java.io.File
 
 data class PlaybackUiState(
     val loggedIn: Boolean = false,
+    val webApiReady: Boolean = false,
     val connected: Boolean = true,
     val networkOnline: Boolean = true,
     val reconnecting: Boolean = false,
@@ -49,6 +57,7 @@ data class PlaybackUiState(
     val title: String? = null,
     val artist: String? = null,
     val artUrl: String? = null,
+    val albumId: String? = null,
     val durationMs: Long = 0,
     val error: String? = null,
 )
@@ -62,11 +71,15 @@ data class PlaybackUiState(
 class PlaybackController private constructor(
     private val appContext: Context,
     val engine: LibrespotEngine,
+    private val webApiAuth: WebApiAuth,
 ) : PlayerEventListener {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private val repository = SpotifyRepository(engine)
+    private val webApi = SpotifyWebApi(webApiAuth)
+    private val database = MonoDatabase.get(appContext)
+    val libraryRepository = LibraryRepository(database, webApi)
+    private val repository = SpotifyRepository(webApi, libraryRepository)
 
     /** uri -> metadata, populated when a list is played so the now-playing bar
      *  and MediaSession have title/artist/art without any extra network call. */
@@ -148,6 +161,7 @@ class PlaybackController private constructor(
             recomputeStatusMessage(
                 it.copy(
                     loggedIn = engine.isLoggedIn(),
+                    webApiReady = webApiAuth.isAuthorized(),
                     networkOnline = isNetworkOnline(),
                 ),
             )
@@ -196,14 +210,56 @@ class PlaybackController private constructor(
     fun logout() {
         scope.launch {
             engine.logout()
+            webApiAuth.clearAll()
+            repository.clearLibraryCache()
             abandonFocus()
             _state.value = recomputeStatusMessage(
                 PlaybackUiState(
                     loggedIn = false,
+                    webApiReady = false,
                     networkOnline = isNetworkOnline(),
                 ),
             )
             onStateChanged?.invoke()
+        }
+    }
+
+    // --- Web API auth (Step 2) ----------------------------------------------
+
+    fun hasWebApiCredentials(): Boolean = webApiAuth.hasCredentials()
+
+    fun saveWebApiCredentials(clientId: String, clientSecret: String) {
+        webApiAuth.saveCredentials(clientId, clientSecret)
+    }
+
+    fun buildWebApiAuthorizeUrl(): String = webApiAuth.buildAuthorizeUrl()
+
+    fun completeWebApiAuth(code: String, onResult: (Result<Unit>) -> Unit) {
+        scope.launch {
+            val result = webApiAuth.exchangeCode(code)
+            result.onSuccess {
+                _state.update {
+                    recomputeStatusMessage(it.copy(webApiReady = true, error = null))
+                }
+            }
+            result.onFailure { e ->
+                _state.update {
+                    recomputeStatusMessage(
+                        it.copy(
+                            webApiReady = false,
+                            error = mapWebApiError(e),
+                        ),
+                    )
+                }
+            }
+            onResult(result)
+        }
+    }
+
+    fun logoutWebApi() {
+        webApiAuth.clearAll()
+        _state.update {
+            recomputeStatusMessage(it.copy(webApiReady = false))
         }
     }
 
@@ -218,6 +274,7 @@ class PlaybackController private constructor(
                     title = track.title,
                     artist = track.artists,
                     artUrl = track.artUrl,
+                    albumId = track.albumId,
                     durationMs = track.durationMs,
                     isLoading = true,
                     isPlaying = true,
@@ -305,41 +362,72 @@ class PlaybackController private constructor(
 
     fun clearAudioCache() = scope.launch { engine.clearAudioCache() }
 
-    /** Search the catalog via the native engine (spclient context-resolve). */
+    /** Search tracks via Web API (catalog search, track type only). */
     suspend fun searchTracks(query: String, limit: Int = 25): Result<List<TrackMetadata>> =
         kotlinx.coroutines.withContext(Dispatchers.IO) {
             try {
-                val tracks = engine.searchTracks(query, limit.toUInt()).map { it.toMetadata() }
+                val results = repository.search(query, limitPerType = limit.coerceIn(1, 10))
+                val tracks = results.tracks.map { it.toMetadata() }.take(limit)
                 android.util.Log.i(
                     "Search",
-                    "searchTracks returned ${tracks.size} results for '$query'; first='${tracks.firstOrNull()?.title}'",
+                    "searchTracks returned ${tracks.size} results for '$query'",
                 )
                 Result.success(tracks)
             } catch (e: Throwable) {
                 android.util.Log.e("Search", "searchTracks failed", e)
-                Result.failure(Exception(mapSpotifyError(e)))
+                Result.failure(Exception(mapWebApiError(e)))
             }
         }
 
-    /** Liked songs via spclient context-resolve (`spotify:user:<id>:collection`). */
-    suspend fun likedTracks(limit: Int = 200): Result<List<TrackMetadata>> =
+    fun likedTracksUiFlow(): Flow<Triple<List<LikedTrackEntity>, Int, Boolean>> =
+        libraryRepository.likedTracksUiFlow()
+
+    fun savedAlbumsUiFlow(): Flow<Triple<List<SavedAlbumEntity>, Int, Boolean>> =
+        libraryRepository.savedAlbumsUiFlow()
+
+    suspend fun refreshLikedTracks(): Boolean =
         kotlinx.coroutines.withContext(Dispatchers.IO) {
-            try {
-                Result.success(repository.likedTracks(limit))
-            } catch (e: Throwable) {
-                android.util.Log.e("Library", "likedTracks failed", e)
-                Result.failure(Exception(mapSpotifyError(e)))
-            }
+            libraryRepository.refreshLikedTracks()
         }
 
-    suspend fun savedAlbums(limit: Int = 50): List<SpotifySavedAlbum> =
+    suspend fun likedTracksNeedsFill(): Boolean =
         kotlinx.coroutines.withContext(Dispatchers.IO) {
-            try {
-                repository.savedAlbums(limit)
-            } catch (e: Throwable) {
-                android.util.Log.e("Library", "savedAlbums failed", e)
-                throw Exception(mapSpotifyError(e))
-            }
+            libraryRepository.likedTracksNeedsFill()
+        }
+
+    suspend fun appendLikedTracks(): Boolean =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            libraryRepository.appendLikedTracks()
+        }
+
+    suspend fun refreshSavedAlbums(): Boolean =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            libraryRepository.refreshSavedAlbums()
+        }
+
+    suspend fun savedAlbumsNeedsFill(): Boolean =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            libraryRepository.savedAlbumsNeedsFill()
+        }
+
+    suspend fun appendSavedAlbums(): Boolean =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            libraryRepository.appendSavedAlbums()
+        }
+
+    suspend fun fillRemainingLikedTracks(): Int =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            libraryRepository.fillRemainingLikedTracks()
+        }
+
+    suspend fun fillRemainingSavedAlbums(): Int =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            libraryRepository.fillRemainingSavedAlbums()
+        }
+
+    suspend fun likedTracksForPlayback(fromIndex: Int): List<TrackMetadata> =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            libraryRepository.likedTracksForPlayback(fromIndex)
         }
 
     suspend fun albumDetail(albumId: String): AlbumDetailResult =
@@ -348,7 +436,7 @@ class PlaybackController private constructor(
                 repository.albumDetail(albumId)
             } catch (e: Throwable) {
                 android.util.Log.e("Library", "albumDetail failed", e)
-                throw Exception(mapSpotifyError(e))
+                throw Exception(mapWebApiError(e))
             }
         }
 
@@ -358,17 +446,27 @@ class PlaybackController private constructor(
                 repository.artistDetail(artistId)
             } catch (e: Throwable) {
                 android.util.Log.e("Library", "artistDetail failed", e)
-                throw Exception(mapSpotifyError(e))
+                throw Exception(mapWebApiError(e))
             }
         }
 
-    suspend fun search(query: String, limitPerType: Int = 5): SearchResults =
+    suspend fun search(query: String, limitPerType: Int = 8): SearchResults =
         kotlinx.coroutines.withContext(Dispatchers.IO) {
             try {
                 repository.search(query, limitPerType)
             } catch (e: Throwable) {
                 android.util.Log.e("Search", "search failed", e)
-                throw Exception(mapSpotifyError(e))
+                throw Exception(mapWebApiError(e))
+            }
+        }
+
+    suspend fun playlistTracks(playlistId: String, limit: Int = 100): List<TrackMetadata> =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            try {
+                repository.playlistTracks(playlistId, limit)
+            } catch (e: Throwable) {
+                android.util.Log.e("Search", "playlistTracks failed", e)
+                throw Exception(mapWebApiError(e))
             }
         }
 
@@ -378,7 +476,7 @@ class PlaybackController private constructor(
                 repository.albumTracks(albumId)
             } catch (e: Throwable) {
                 android.util.Log.e("Library", "albumTracks failed", e)
-                throw Exception(mapSpotifyError(e))
+                throw Exception(mapWebApiError(e))
             }
         }
 
@@ -389,28 +487,59 @@ class PlaybackController private constructor(
 
     suspend fun saveTrack(uri: String) =
         kotlinx.coroutines.withContext(Dispatchers.IO) {
-            repository.saveTrack(uri)
+            try {
+                repository.saveTrack(uri)
+            } catch (e: Throwable) {
+                android.util.Log.e("Library", "saveTrack failed", e)
+                throw Exception(mapWebApiError(e))
+            }
         }
 
     suspend fun removeTrack(uri: String) =
         kotlinx.coroutines.withContext(Dispatchers.IO) {
-            repository.removeTrack(uri)
+            try {
+                repository.removeTrack(uri)
+            } catch (e: Throwable) {
+                android.util.Log.e("Library", "removeTrack failed", e)
+                throw Exception(mapWebApiError(e))
+            }
         }
 
     suspend fun saveAlbum(albumId: String) =
         kotlinx.coroutines.withContext(Dispatchers.IO) {
-            repository.saveAlbum(albumId)
+            try {
+                repository.saveAlbum(albumId)
+            } catch (e: Throwable) {
+                android.util.Log.e("Library", "saveAlbum failed", e)
+                throw Exception(mapWebApiError(e))
+            }
         }
 
     suspend fun removeAlbum(albumId: String) =
         kotlinx.coroutines.withContext(Dispatchers.IO) {
-            repository.removeAlbum(albumId)
+            try {
+                repository.removeAlbum(albumId)
+            } catch (e: Throwable) {
+                android.util.Log.e("Library", "removeAlbum failed", e)
+                throw Exception(mapWebApiError(e))
+            }
         }
 
-    /** OAuth access token for spclient session auth. */
-    suspend fun accessToken(): String = kotlinx.coroutines.withContext(Dispatchers.IO) {
-        engine.accessToken()
+    /** Fetch track metadata (art, title, duration) from the Web API for now-playing. */
+    fun refreshNowPlayingFromWebApi() {
+        val uri = _state.value.currentUri ?: return
+        enrichNowPlayingFromWebApi(normalizeUri(uri))
     }
+
+    suspend fun dailyMixes(): List<com.lightphone.spotify.data.SpotifyPlaylistSimple> =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            try {
+                repository.dailyMixes()
+            } catch (e: Throwable) {
+                android.util.Log.e("Library", "dailyMixes failed", e)
+                throw Exception(mapWebApiError(e))
+            }
+        }
 
     /** Start the MediaSessionService so OS media controls are available. */
     fun ensureServiceStarted() {
@@ -491,18 +620,44 @@ class PlaybackController private constructor(
     }
 
     private fun fetchMetadata(uri: String) {
-        val meta = trackMetadata[uri]
-        if (meta == null) {
-            _state.update { it.copy(title = null, artist = null, artUrl = null, durationMs = 0) }
+        val normalized = normalizeUri(uri)
+        val cached = trackMetadata[normalized]
+        if (cached != null) {
+            applyTrackMetadata(cached)
+            if (cached.artUrl != null) return
+        } else {
+            _state.update {
+                it.copy(title = null, artist = null, artUrl = null, albumId = null, durationMs = 0)
+            }
             onStateChanged?.invoke()
-            return
         }
+        enrichNowPlayingFromWebApi(normalized)
+    }
+
+    private fun enrichNowPlayingFromWebApi(uri: String) {
+        scope.launch {
+            runCatching { repository.trackMetadataForUri(uri) }
+                .onSuccess { meta ->
+                    if (meta == null) return@onSuccess
+                    trackMetadata[uri] = meta
+                    if (normalizeUri(_state.value.currentUri.orEmpty()) == uri) {
+                        applyTrackMetadata(meta)
+                    }
+                }
+                .onFailure { e ->
+                    android.util.Log.w("Playback", "Web API now-playing enrich failed", e)
+                }
+        }
+    }
+
+    private fun applyTrackMetadata(meta: TrackMetadata) {
         _state.update {
             it.copy(
                 title = meta.title,
                 artist = meta.artists,
                 artUrl = meta.artUrl,
-                durationMs = meta.durationMs,
+                albumId = meta.albumId,
+                durationMs = if (meta.durationMs > 0) meta.durationMs else it.durationMs,
             )
         }
         onStateChanged?.invoke()
@@ -569,7 +724,8 @@ class PlaybackController private constructor(
                     NativeInit.ensureLoaded(appContext)
                     val cacheDir = File(appContext.filesDir, "spotify-cache").apply { mkdirs() }
                     val engine = LibrespotEngine(cacheDir.absolutePath)
-                    PlaybackController(appContext, engine).also { instance = it }
+                    val webApiAuth = WebApiAuth(appContext)
+                    PlaybackController(appContext, engine, webApiAuth).also { instance = it }
                 }
             }
         }

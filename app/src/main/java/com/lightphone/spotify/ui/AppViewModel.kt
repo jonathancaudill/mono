@@ -3,20 +3,25 @@ package com.lightphone.spotify.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.compose.foundation.lazy.LazyListState
 import com.lightphone.spotify.App
+import com.lightphone.spotify.data.SearchFilter
 import com.lightphone.spotify.data.SearchResults
 import com.lightphone.spotify.data.SearchResultItem
 import com.lightphone.spotify.data.SpotifyAlbumDetail
 import com.lightphone.spotify.data.SpotifyArtistDetail
-import com.lightphone.spotify.data.SpotifySavedAlbum
 import com.lightphone.spotify.data.SpotifyTrack
 import com.lightphone.spotify.data.TrackMetadata
+import com.lightphone.spotify.data.local.LikedTrackEntity
+import com.lightphone.spotify.data.local.SavedAlbumEntity
 import com.lightphone.spotify.data.toMetadata
 import com.lightphone.spotify.ffi.NormalizationType
 import com.lightphone.spotify.ffi.StreamingQuality
 import com.lightphone.spotify.playback.PlaybackController
 import com.lightphone.spotify.playback.PlaybackUiState
 import com.lightphone.spotify.playback.SettingsSnapshot
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -27,13 +32,6 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withContext
-
-data class ListUiState<T>(
-    val loading: Boolean = false,
-    val refreshing: Boolean = false,
-    val items: List<T> = emptyList(),
-    val error: String? = null,
-)
 
 data class AlbumDetailState(
     val loading: Boolean = false,
@@ -56,11 +54,13 @@ data class SearchUiState(
     val results: SearchResults? = null,
     val loading: Boolean = false,
     val error: String? = null,
+    val filter: SearchFilter = SearchFilter.All,
 )
 
 data class PlayingExtrasState(
     val isTrackSaved: Boolean = false,
     val savePending: Boolean = false,
+    val saveError: String? = null,
 )
 
 data class SettingsUiState(
@@ -79,11 +79,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     val playback: StateFlow<PlaybackUiState> = controller.state
 
-    private val _likedSongs = MutableStateFlow(ListUiState<TrackMetadata>())
-    val likedSongs: StateFlow<ListUiState<TrackMetadata>> = _likedSongs.asStateFlow()
+    private val _likedTracks = MutableStateFlow(LibraryListUiState<LikedTrackEntity>())
+    val likedTracks: StateFlow<LibraryListUiState<LikedTrackEntity>> = _likedTracks.asStateFlow()
 
-    private val _albums = MutableStateFlow(ListUiState<SpotifySavedAlbum>())
-    val albums: StateFlow<ListUiState<SpotifySavedAlbum>> = _albums.asStateFlow()
+    private val _savedAlbums = MutableStateFlow(LibraryListUiState<SavedAlbumEntity>())
+    val savedAlbums: StateFlow<LibraryListUiState<SavedAlbumEntity>> = _savedAlbums.asStateFlow()
+
+    private var likedTracksStarted = false
+    private var savedAlbumsStarted = false
+    private var likedFillJob: Job? = null
+    private var likedLookaheadJob: Job? = null
+    private var savedFillJob: Job? = null
+    private var savedLookaheadJob: Job? = null
 
     private val _search = MutableStateFlow(SearchUiState())
     val search: StateFlow<SearchUiState> = _search.asStateFlow()
@@ -121,59 +128,185 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun onLoggedIn() {
-        // Library loads deferred to tab open to avoid API burst on login.
+    fun saveWebApiCredentials(clientId: String, clientSecret: String) {
+        controller.saveWebApiCredentials(clientId, clientSecret)
     }
 
-    fun loadLikedSongs(refresh: Boolean = true) {
+    fun buildWebApiAuthorizeUrl(): String = controller.buildWebApiAuthorizeUrl()
+
+    fun completeWebApiAuth(code: String, onResult: (Result<Unit>) -> Unit) {
+        controller.completeWebApiAuth(code, onResult)
+    }
+
+    fun onLoggedIn() {
+        // Library tabs load on first visit via ensureLikedTracksLoaded / ensureSavedAlbumsLoaded.
+    }
+
+    fun ensureLikedTracksLoaded() {
+        if (likedTracksStarted) return
+        likedTracksStarted = true
+        _likedTracks.value = _likedTracks.value.copy(initialLoading = true)
         viewModelScope.launch {
-            _likedSongs.value = _likedSongs.value.copy(
-                loading = !refresh && _likedSongs.value.items.isEmpty(),
-                refreshing = refresh,
-                error = null,
-            )
-            controller.likedTracks()
-                .onSuccess { tracks ->
-                    _likedSongs.value = ListUiState(
-                        items = tracks,
-                        loading = false,
-                        refreshing = false,
-                        error = null,
-                    )
-                }
+            controller.likedTracksUiFlow().collect { (items, remoteTotal, hasMore) ->
+                _likedTracks.update { it.copy(items = items, remoteTotal = remoteTotal, hasMore = hasMore) }
+            }
+        }
+        refreshLikedTracks()
+    }
+
+    fun refreshLikedTracks() {
+        likedFillJob?.cancel()
+        likedFillJob = null
+        likedLookaheadJob?.cancel()
+        likedLookaheadJob = null
+        viewModelScope.launch {
+            val hadItems = _likedTracks.value.items.isNotEmpty()
+            _likedTracks.update {
+                it.copy(
+                    refreshing = hadItems,
+                    initialLoading = !hadItems,
+                    error = null,
+                )
+            }
+            runCatching { controller.refreshLikedTracks() }
                 .onFailure { e ->
-                    _likedSongs.value = _likedSongs.value.copy(
-                        loading = false,
-                        refreshing = false,
-                        error = e.message ?: "Could not load liked songs",
-                    )
+                    _likedTracks.update { it.copy(error = e.message ?: "Could not load liked songs") }
                 }
+            _likedTracks.update { it.copy(refreshing = false, initialLoading = false) }
+            if (controller.likedTracksNeedsFill()) {
+                startLikedTracksFill()
+            }
         }
     }
 
-    fun loadAlbums(refresh: Boolean = true) {
+    fun ensureLikedTracksBufferAhead(lastVisible: Int) {
+        if (likedFillJob?.isActive == true) return
+        val state = _likedTracks.value
+        val target = lastVisible + LOOKAHEAD_ROWS
+        if (state.items.size >= target || !state.hasMore) return
+        if (likedLookaheadJob?.isActive == true) return
+        likedLookaheadJob = viewModelScope.launch {
+            while (_likedTracks.value.items.size < target && _likedTracks.value.hasMore) {
+                val hasMore = runCatching { controller.appendLikedTracks() }
+                    .onFailure { e ->
+                        android.util.Log.e("Library", "append liked tracks failed", e)
+                    }
+                    .getOrDefault(false)
+                if (!hasMore) break
+            }
+        }
+    }
+
+    private fun startLikedTracksFill() {
+        if (likedFillJob?.isActive == true) return
+        likedFillJob = viewModelScope.launch {
+            _likedTracks.update { it.copy(appending = true) }
+            try {
+                runCatching { controller.fillRemainingLikedTracks() }
+                    .onFailure { e ->
+                        android.util.Log.e("Library", "fill liked tracks failed", e)
+                    }
+            } finally {
+                _likedTracks.update { it.copy(appending = false) }
+            }
+        }
+    }
+
+    fun ensureSavedAlbumsLoaded() {
+        if (savedAlbumsStarted) return
+        savedAlbumsStarted = true
+        _savedAlbums.value = _savedAlbums.value.copy(initialLoading = true)
         viewModelScope.launch {
-            _albums.value = _albums.value.copy(
-                loading = !refresh && _albums.value.items.isEmpty(),
-                refreshing = refresh,
-                error = null,
-            )
-            runCatching { controller.savedAlbums() }
-                .onSuccess { items ->
-                    _albums.value = ListUiState(
-                        items = items,
-                        loading = false,
-                        refreshing = false,
-                        error = null,
-                    )
-                }
+            controller.savedAlbumsUiFlow().collect { (items, remoteTotal, hasMore) ->
+                _savedAlbums.update { it.copy(items = items, remoteTotal = remoteTotal, hasMore = hasMore) }
+            }
+        }
+        refreshSavedAlbums()
+    }
+
+    fun refreshSavedAlbums() {
+        savedFillJob?.cancel()
+        savedFillJob = null
+        savedLookaheadJob?.cancel()
+        savedLookaheadJob = null
+        viewModelScope.launch {
+            val hadItems = _savedAlbums.value.items.isNotEmpty()
+            if (!hadItems) {
+                _savedAlbums.update { it.copy(initialLoading = true, error = null) }
+            } else {
+                _savedAlbums.update { it.copy(refreshing = true, error = null) }
+            }
+            runCatching { controller.refreshSavedAlbums() }
                 .onFailure { e ->
-                    _albums.value = _albums.value.copy(
-                        loading = false,
-                        refreshing = false,
-                        error = e.message ?: "Could not load albums",
-                    )
+                    _savedAlbums.update { it.copy(error = e.message ?: "Could not load albums") }
                 }
+            _savedAlbums.update { it.copy(refreshing = false, initialLoading = false) }
+            if (controller.savedAlbumsNeedsFill()) {
+                startSavedAlbumsFill()
+            }
+        }
+    }
+
+    fun ensureSavedAlbumsBufferAhead(lastVisible: Int) {
+        if (savedFillJob?.isActive == true) return
+        val state = _savedAlbums.value
+        val target = lastVisible + LOOKAHEAD_ROWS
+        if (state.items.size >= target || !state.hasMore) return
+        if (savedLookaheadJob?.isActive == true) return
+        savedLookaheadJob = viewModelScope.launch {
+            while (_savedAlbums.value.items.size < target && _savedAlbums.value.hasMore) {
+                val hasMore = runCatching { controller.appendSavedAlbums() }
+                    .onFailure { e ->
+                        android.util.Log.e("Library", "append saved albums failed", e)
+                    }
+                    .getOrDefault(false)
+                if (!hasMore) break
+            }
+        }
+    }
+
+    suspend fun scrollLikedTracksToIndex(listState: LazyListState, targetIndex: Int) {
+        while (_likedTracks.value.items.size <= targetIndex && _likedTracks.value.hasMore) {
+            val hasMore = runCatching { controller.appendLikedTracks() }
+                .onFailure { e ->
+                    android.util.Log.e("Library", "append liked tracks failed", e)
+                }
+                .getOrDefault(false)
+            if (!hasMore) break
+        }
+        val items = _likedTracks.value.items
+        if (items.isEmpty()) return
+        val index = targetIndex.coerceIn(0, items.lastIndex)
+        listState.scrollToItem(index)
+    }
+
+    suspend fun scrollSavedAlbumsToIndex(listState: LazyListState, targetIndex: Int) {
+        while (_savedAlbums.value.items.size <= targetIndex && _savedAlbums.value.hasMore) {
+            val hasMore = runCatching { controller.appendSavedAlbums() }
+                .onFailure { e ->
+                    android.util.Log.e("Library", "append saved albums failed", e)
+                }
+                .getOrDefault(false)
+            if (!hasMore) break
+        }
+        val items = _savedAlbums.value.items
+        if (items.isEmpty()) return
+        val index = targetIndex.coerceIn(0, items.lastIndex)
+        listState.scrollToItem(index)
+    }
+
+    private fun startSavedAlbumsFill() {
+        if (savedFillJob?.isActive == true) return
+        savedFillJob = viewModelScope.launch {
+            _savedAlbums.update { it.copy(appending = true) }
+            try {
+                runCatching { controller.fillRemainingSavedAlbums() }
+                    .onFailure { e ->
+                        android.util.Log.e("Library", "fill saved albums failed", e)
+                    }
+            } finally {
+                _savedAlbums.update { it.copy(appending = false) }
+            }
         }
     }
 
@@ -206,7 +339,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 isSaved = if (result.isSuccess) !current.isSaved else current.isSaved,
                 error = result.exceptionOrNull()?.message,
             )
-            if (result.isSuccess) loadAlbums(refresh = true)
         }
     }
 
@@ -238,16 +370,22 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val trimmed = query.trim()
         searchJob?.cancel()
         searchJob = viewModelScope.launch {
-            _search.value = SearchUiState(loading = true, query = trimmed, error = null, results = null)
+            _search.value = _search.value.copy(
+                loading = true,
+                query = trimmed,
+                error = null,
+                filter = SearchFilter.All,
+            )
             runCatching {
                 withTimeout(SEARCH_TIMEOUT_MS) { controller.search(trimmed) }
             }
                 .onSuccess { results ->
-                    _search.value = SearchUiState(
+                    _search.value = _search.value.copy(
                         query = trimmed,
                         results = results,
                         loading = false,
                         error = if (results.isEmpty()) "No results" else null,
+                        filter = SearchFilter.All,
                     )
                 }
                 .onFailure { e ->
@@ -255,14 +393,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         is TimeoutCancellationException -> "Search timed out — try again."
                         else -> e.message ?: "Search failed"
                     }
-                    _search.value = SearchUiState(
+                    _search.value = _search.value.copy(
                         query = trimmed,
                         loading = false,
                         error = message,
-                        results = null,
                     )
                 }
         }
+    }
+
+    fun setSearchFilter(filter: SearchFilter) {
+        _search.value = _search.value.copy(filter = filter)
     }
 
     fun playTracks(tracks: List<TrackMetadata>, startIndex: Int) {
@@ -272,7 +413,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun playLikedFrom(index: Int) {
-        playTracks(_likedSongs.value.items, index)
+        viewModelScope.launch {
+            val tracks = runCatching { controller.likedTracksForPlayback(index) }.getOrNull()
+            if (!tracks.isNullOrEmpty()) {
+                playTracks(tracks, 0)
+            }
+        }
     }
 
     fun playAlbumFrom(albumId: String, trackIndex: Int) {
@@ -290,15 +436,48 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         playTracks(listOf(item.track.toMetadata()), 0)
     }
 
+    fun playSearchPlaylist(playlistId: String, onStarted: () -> Unit = {}) {
+        viewModelScope.launch {
+            val tracks = runCatching { controller.playlistTracks(playlistId) }.getOrNull()
+            if (!tracks.isNullOrEmpty()) {
+                playTracks(tracks, 0)
+                onStarted()
+            }
+        }
+    }
+
+    fun openSearchResult(
+        item: SearchResultItem,
+        onOpenAlbum: (String, String) -> Unit,
+        onOpenArtist: (String) -> Unit,
+        onPlayTrack: (SearchResultItem.Track) -> Unit,
+        onPlayPlaylist: (String) -> Unit,
+    ) {
+        when (item) {
+            is SearchResultItem.Track -> onPlayTrack(item)
+            is SearchResultItem.Album -> onOpenAlbum(item.album.id, item.album.name)
+            is SearchResultItem.Artist -> onOpenArtist(item.artist.id)
+            is SearchResultItem.Playlist -> onPlayPlaylist(item.playlist.id)
+        }
+    }
+
     fun playArtistTopTrack(index: Int) {
         val tracks = _artistDetail.value.topTracks.map { it.toMetadata() }
         playTracks(tracks, index)
     }
 
-    fun refreshPlayingSaveState() {
+    fun refreshPlayingScreen() {
         val uri = playback.value.currentUri ?: return
+        controller.refreshNowPlayingFromWebApi()
         viewModelScope.launch {
-            val saved = runCatching { controller.isTrackSaved(uri) }.getOrDefault(false)
+            _playingExtras.value = _playingExtras.value.copy(saveError = null)
+            val saved = runCatching { controller.isTrackSaved(uri) }
+                .getOrElse { e ->
+                    _playingExtras.value = _playingExtras.value.copy(
+                        saveError = e.message ?: "Could not check liked status",
+                    )
+                    return@launch
+                }
             _playingExtras.value = _playingExtras.value.copy(isTrackSaved = saved)
         }
     }
@@ -308,7 +487,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val current = _playingExtras.value
             if (current.savePending) return@launch
-            _playingExtras.value = current.copy(savePending = true)
+            _playingExtras.value = current.copy(savePending = true, saveError = null)
             val wasSaved = current.isTrackSaved
             val result = runCatching {
                 if (wasSaved) controller.removeTrack(uri) else controller.saveTrack(uri)
@@ -316,8 +495,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             _playingExtras.value = PlayingExtrasState(
                 isTrackSaved = if (result.isSuccess) !wasSaved else wasSaved,
                 savePending = false,
+                saveError = result.exceptionOrNull()?.message,
             )
-            if (result.isSuccess && !wasSaved) loadLikedSongs(refresh = true)
         }
     }
 
@@ -368,6 +547,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         private const val SEARCH_TIMEOUT_MS = 30_000L
+        private const val LOOKAHEAD_ROWS = 150
     }
 }
 
