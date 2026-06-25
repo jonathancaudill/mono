@@ -5,8 +5,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Album
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.QueueMusic
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
@@ -15,34 +16,37 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
-import com.lightphone.spotify.ui.components.buildLibraryDateIndex
 import com.lightphone.spotify.ui.AppViewModel
 import com.lightphone.spotify.ui.components.LibraryInfiniteList
 import com.lightphone.spotify.ui.components.MonoContentContainer
 import com.lightphone.spotify.ui.components.MonoMediaListItem
+import com.lightphone.spotify.ui.components.buildLibraryAlphaIndex
 import com.lightphone.spotify.ui.theme.n
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AlbumsScreen(
+fun PlaylistsScreen(
     vm: AppViewModel,
     onOpenPlaying: () -> Unit,
-    onOpenAlbum: (String, String) -> Unit,
+    onOpenPlaylist: (String, String) -> Unit,
+    onCreatePlaylist: () -> Unit,
 ) {
     LaunchedEffect(Unit) {
-        vm.ensureSavedAlbumsLoaded()
-        vm.resumeSavedAlbumsFillIfNeeded()
+        vm.ensurePlaylistsLoaded()
+        vm.resumePlaylistsFillIfNeeded()
     }
 
-    val state by vm.savedAlbums.collectAsState()
+    val state by vm.playlists.collectAsState()
     val listState = rememberLazyListState()
-    val dateIndex = remember(state.items) {
-        buildLibraryDateIndex(state.items) { it.added_at }
+    val alphaIndex = remember(state.items) {
+        buildLibraryAlphaIndex(state.items) { it.name }
     }
 
     MonoContentContainer(
-        title = "Albums",
+        title = "Playlists",
         hideBackButton = true,
+        leftIcon = Icons.Default.Add,
+        onLeftIconClick = onCreatePlaylist,
         rightIcon = Icons.Default.GraphicEq,
         onRightIconClick = onOpenPlaying,
         horizontalPadding = n(20),
@@ -50,7 +54,7 @@ fun AlbumsScreen(
     ) {
         PullToRefreshBox(
             isRefreshing = state.refreshing,
-            onRefresh = { vm.refreshSavedAlbums() },
+            onRefresh = { vm.refreshPlaylists() },
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth(),
@@ -59,12 +63,11 @@ fun AlbumsScreen(
                 state.error != null && state.items.isEmpty() ->
                     EmptyListMessage(state.error!!)
                 state.initialLoading && state.items.isEmpty() ->
-                    EmptyListMessage("Loading albums…")
+                    EmptyListMessage("Loading playlists…")
                 state.isEmpty ->
-                    EmptyListMessage("No saved albums found.")
+                    EmptyListMessage("No playlists found.")
                 else -> Column(Modifier.fillMaxSize()) {
                     if (state.error != null && state.items.isNotEmpty()) {
-                        // TODO: wire styled banner in separate UI task
                         LibraryPartialSyncBanner(state.error!!)
                     }
                     LibraryInfiniteList(
@@ -74,23 +77,20 @@ fun AlbumsScreen(
                         hasMore = state.hasMore,
                         appending = state.appending,
                         canLoadMore = state.canLoadMore,
-                        itemKey = { it.album_id },
-                        onEnsureBufferAhead = vm::ensureSavedAlbumsBufferAhead,
-                        dateIndex = dateIndex,
-                        onScrubToIndex = { index -> vm.scrollSavedAlbumsToIndex(listState, index) },
+                        itemKey = { it.playlist_id },
+                        onEnsureBufferAhead = vm::ensurePlaylistsBufferAhead,
+                        alphaIndex = alphaIndex,
+                        onScrubToIndex = { index -> vm.scrollPlaylistsToIndex(listState, index) },
                         onScrubJumpChange = { active ->
                             if (active) vm.onScrubJumpStart() else vm.onScrubJumpEnd()
                         },
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth(),
-                    ) { _, saved ->
+                    ) { _, playlist ->
                         MonoMediaListItem(
-                            primaryText = saved.name,
-                            secondaryText = saved.artist_names,
+                            primaryText = playlist.name,
+                            secondaryText = playlist.owner_name,
                             showImage = false,
-                            placeholderIcon = Icons.Default.Album,
-                            onClick = { onOpenAlbum(saved.album_id, saved.name) },
+                            placeholderIcon = Icons.Default.QueueMusic,
+                            onClick = { onOpenPlaylist(playlist.playlist_id, playlist.name) },
                         )
                     }
                 }

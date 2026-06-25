@@ -31,6 +31,11 @@ import com.lightphone.spotify.ui.screens.LikedSongsScreen
 import com.lightphone.spotify.ui.screens.LoginScreen
 import com.lightphone.spotify.ui.screens.WebApiSetupScreen
 import com.lightphone.spotify.ui.screens.PlayingScreen
+import com.lightphone.spotify.ui.screens.QueueScreen
+import com.lightphone.spotify.ui.screens.CreatePlaylistScreen
+import com.lightphone.spotify.ui.screens.PlaylistDetailScreen
+import com.lightphone.spotify.ui.screens.PlaylistPickerScreen
+import com.lightphone.spotify.ui.screens.PlaylistsScreen
 import com.lightphone.spotify.ui.screens.SearchResultsScreen
 import com.lightphone.spotify.ui.screens.SearchScreen
 import com.lightphone.spotify.ui.screens.SettingsScreen
@@ -41,6 +46,7 @@ import java.net.URLDecoder
 private val TabRoutes = setOf(
     MonoTab.Liked.route,
     MonoTab.Albums.route,
+    MonoTab.Playlists.route,
     MonoTab.Search.route,
     MonoTab.Settings.route,
 )
@@ -63,6 +69,7 @@ fun SpotifyApp(vm: AppViewModel = viewModel()) {
 @Composable
 private fun MainNavigation(vm: AppViewModel) {
     val navController = rememberNavController()
+    val overlayNav = rememberOverlayNavigator(navController)
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route?.substringBefore('?')
     val playback by vm.playback.collectAsState()
@@ -107,19 +114,35 @@ private fun MainNavigation(vm: AppViewModel) {
                 composable(MonoTab.Liked.route) {
                     LikedSongsScreen(
                         vm = vm,
-                        onOpenPlaying = { navController.navigate(Routes.Playing) },
+                        onOpenPlaying = { overlayNav.navigate(Routes.Playing) },
                         onPlayTrack = { index ->
                             vm.playLikedFrom(index)
-                            navController.navigate(Routes.Playing)
+                            overlayNav.navigate(Routes.Playing)
+                        },
+                        onAddToPlaylist = { uri ->
+                            overlayNav.navigate(Routes.playlistPicker(uri))
                         },
                     )
                 }
                 composable(MonoTab.Albums.route) {
                     AlbumsScreen(
                         vm = vm,
-                        onOpenPlaying = { navController.navigate(Routes.Playing) },
+                        onOpenPlaying = { overlayNav.navigate(Routes.Playing) },
                         onOpenAlbum = { id, name ->
-                            navController.navigate(Routes.album(id, name))
+                            overlayNav.navigate(Routes.album(id, name))
+                        },
+                    )
+                }
+                composable(MonoTab.Playlists.route) {
+                    PlaylistsScreen(
+                        vm = vm,
+                        onOpenPlaying = { overlayNav.navigate(Routes.Playing) },
+                        onOpenPlaylist = { id, name ->
+                            overlayNav.navigate(Routes.playlist(id, name))
+                        },
+                        onCreatePlaylist = {
+                            vm.resetCreatePlaylistState()
+                            overlayNav.navigate(Routes.CreatePlaylist)
                         },
                     )
                 }
@@ -127,7 +150,7 @@ private fun MainNavigation(vm: AppViewModel) {
                     SearchScreen(
                         vm = vm,
                         onSubmit = { query ->
-                            navController.navigate(Routes.searchResults(query))
+                            overlayNav.navigate(Routes.searchResults(query))
                         },
                     )
                 }
@@ -142,8 +165,18 @@ private fun MainNavigation(vm: AppViewModel) {
                         vm = vm,
                         onBack = { navController.popBackStack() },
                         onOpenAlbum = { albumId ->
-                            navController.navigate(Routes.album(albumId))
+                            overlayNav.navigate(Routes.album(albumId))
                         },
+                        onOpenQueue = { overlayNav.navigate(Routes.Queue) },
+                        onAddToPlaylist = { uri ->
+                            overlayNav.navigate(Routes.playlistPicker(uri))
+                        },
+                    )
+                }
+                composable(Routes.Queue) {
+                    QueueScreen(
+                        vm = vm,
+                        onBack = { navController.popBackStack() },
                     )
                 }
                 composable(
@@ -156,17 +189,20 @@ private fun MainNavigation(vm: AppViewModel) {
                         query = query,
                         onBack = { navController.popBackStack() },
                         onOpenAlbum = { id, name ->
-                            navController.navigate(Routes.album(id, name))
+                            overlayNav.navigate(Routes.album(id, name))
                         },
-                        onOpenArtist = { id -> navController.navigate(Routes.artist(id)) },
+                        onOpenArtist = { id -> overlayNav.navigate(Routes.artist(id)) },
                         onPlayTrack = { track ->
                             vm.playSearchTrack(track)
-                            navController.navigate(Routes.Playing)
+                            overlayNav.navigate(Routes.Playing)
                         },
-                        onPlayPlaylist = { playlistId ->
-                            vm.playSearchPlaylist(playlistId) {
-                                navController.navigate(Routes.Playing)
+                        onPlayPlaylist = { id, name ->
+                            vm.playSearchPlaylist(id, name) {
+                                overlayNav.navigate(Routes.Playing)
                             }
+                        },
+                        onAddToPlaylist = { uri ->
+                            overlayNav.navigate(Routes.playlistPicker(uri))
                         },
                     )
                 }
@@ -187,11 +223,69 @@ private fun MainNavigation(vm: AppViewModel) {
                         albumId = albumId,
                         fallbackTitle = title.ifBlank { "Album" },
                         onBack = { navController.popBackStack() },
-                        onOpenArtist = { id -> navController.navigate(Routes.artist(id)) },
+                        onOpenArtist = { id -> overlayNav.navigate(Routes.artist(id)) },
                         onPlayTrack = { index ->
                             vm.playAlbumFrom(albumId, index)
-                            navController.navigate(Routes.Playing)
+                            overlayNav.navigate(Routes.Playing)
                         },
+                        onAddToPlaylist = { uri ->
+                            overlayNav.navigate(Routes.playlistPicker(uri))
+                        },
+                    )
+                }
+                composable(
+                    route = Routes.Playlist,
+                    arguments = listOf(
+                        navArgument("playlistId") { type = NavType.StringType },
+                        navArgument("title") { type = NavType.StringType; defaultValue = "" },
+                    ),
+                ) { entry ->
+                    val playlistId = entry.arguments?.getString("playlistId").orEmpty()
+                    val title = URLDecoder.decode(
+                        entry.arguments?.getString("title").orEmpty(),
+                        Charsets.UTF_8.name(),
+                    )
+                    PlaylistDetailScreen(
+                        vm = vm,
+                        playlistId = playlistId,
+                        fallbackTitle = title.ifBlank { "Playlist" },
+                        onBack = { navController.popBackStack() },
+                        onPlayTrack = { index ->
+                            vm.playPlaylistFrom(playlistId, index)
+                            overlayNav.navigate(Routes.Playing)
+                        },
+                        onAddToPlaylist = { uri ->
+                            overlayNav.navigate(Routes.playlistPicker(uri))
+                        },
+                    )
+                }
+                composable(Routes.CreatePlaylist) {
+                    CreatePlaylistScreen(
+                        vm = vm,
+                        onBack = { navController.popBackStack() },
+                        onCreated = { id, name ->
+                            navController.popBackStack()
+                            overlayNav.navigate(Routes.playlist(id, name))
+                        },
+                    )
+                }
+                composable(
+                    route = Routes.PlaylistPicker,
+                    arguments = listOf(navArgument("trackUri") { type = NavType.StringType }),
+                ) { entry ->
+                    val trackUri = URLDecoder.decode(
+                        entry.arguments?.getString("trackUri").orEmpty(),
+                        Charsets.UTF_8.name(),
+                    )
+                    PlaylistPickerScreen(
+                        vm = vm,
+                        trackUri = trackUri,
+                        onBack = { navController.popBackStack() },
+                        onCreatePlaylist = {
+                            vm.resetCreatePlaylistState()
+                            overlayNav.navigate(Routes.CreatePlaylist)
+                        },
+                        onAdded = { navController.popBackStack() },
                     )
                 }
                 composable(
@@ -204,11 +298,14 @@ private fun MainNavigation(vm: AppViewModel) {
                         artistId = artistId,
                         onBack = { navController.popBackStack() },
                         onOpenAlbum = { id, name ->
-                            navController.navigate(Routes.album(id, name))
+                            overlayNav.navigate(Routes.album(id, name))
                         },
                         onPlayTopTrack = { index ->
                             vm.playArtistTopTrack(index)
-                            navController.navigate(Routes.Playing)
+                            overlayNav.navigate(Routes.Playing)
+                        },
+                        onAddToPlaylist = { uri ->
+                            overlayNav.navigate(Routes.playlistPicker(uri))
                         },
                     )
                 }

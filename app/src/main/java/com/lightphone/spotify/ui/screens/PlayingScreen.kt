@@ -14,13 +14,17 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.PlaylistAdd
+import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.Repeat
+import androidx.compose.material.icons.filled.RepeatOne
 import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
@@ -31,9 +35,11 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import com.lightphone.spotify.ffi.RepeatMode
 import com.lightphone.spotify.playback.PlaybackUiState
 import com.lightphone.spotify.ui.AppViewModel
 import com.lightphone.spotify.ui.components.MonoContentContainer
@@ -49,6 +55,8 @@ fun PlayingScreen(
     vm: AppViewModel,
     onBack: () -> Unit,
     onOpenAlbum: (String) -> Unit,
+    onOpenQueue: () -> Unit,
+    onAddToPlaylist: ((String) -> Unit)? = null,
 ) {
     val playback by vm.playback.collectAsState()
     val extras by vm.playingExtras.collectAsState()
@@ -63,7 +71,9 @@ fun PlayingScreen(
         title = " ",
         hideBackButton = false,
         onBack = onBack,
-        rightIconVisible = false,
+        rightIcon = Icons.AutoMirrored.Filled.QueueMusic,
+        onRightIconClick = onOpenQueue,
+        rightIconVisible = hasTrack,
         horizontalPadding = n(20),
         topPadding = n(0),
         modifier = Modifier.fillMaxSize(),
@@ -85,8 +95,8 @@ fun PlayingScreen(
                     imageUrl = playback.artUrl,
                     placeholderIcon = Icons.Default.MusicNote,
                     modifier = Modifier
-                        .size(n(200))
-                        .padding(bottom = n(20)),
+                        .padding(bottom = n(20))
+                        .size(n(200)),
                 )
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -133,9 +143,19 @@ fun PlayingScreen(
                     modifier = Modifier
                         .fillMaxWidth(0.92f)
                         .padding(bottom = n(20)),
-                    horizontalArrangement = Arrangement.Center,
+                    horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    if (onAddToPlaylist != null && playback.currentUri != null) {
+                        Icon(
+                            Icons.Default.PlaylistAdd,
+                            contentDescription = "Add to playlist",
+                            tint = MonoColors.Foreground,
+                            modifier = Modifier
+                                .size(n(30))
+                                .tap { onAddToPlaylist(playback.currentUri!!) },
+                        )
+                    }
                     Icon(
                         if (extras.isTrackSaved) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
                         contentDescription = "Like",
@@ -206,7 +226,12 @@ private fun PlaybackControls(playback: PlaybackUiState, vm: AppViewModel) {
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(Icons.Default.Shuffle, contentDescription = null, tint = MonoColors.Foreground, modifier = Modifier.size(n(30)))
+        PlaybackModeIcon(
+            icon = Icons.Default.Shuffle,
+            active = playback.shuffleEnabled,
+            contentDescription = "Shuffle",
+            onClick = vm::toggleShuffle,
+        )
         Icon(
             Icons.Default.SkipPrevious,
             contentDescription = "Previous",
@@ -225,6 +250,44 @@ private fun PlaybackControls(playback: PlaybackUiState, vm: AppViewModel) {
             tint = MonoColors.Foreground,
             modifier = Modifier.size(n(52)).tap { vm.next() },
         )
-        Icon(Icons.Default.Repeat, contentDescription = null, tint = MonoColors.Foreground, modifier = Modifier.size(n(30)))
+        PlaybackModeIcon(
+            icon = when (playback.repeatMode) {
+                RepeatMode.TRACK -> Icons.Default.RepeatOne
+                else -> Icons.Default.Repeat
+            },
+            active = playback.repeatMode != RepeatMode.OFF,
+            contentDescription = "Repeat",
+            onClick = vm::toggleRepeat,
+        )
+    }
+}
+
+@Composable
+private fun PlaybackModeIcon(
+    icon: ImageVector,
+    active: Boolean,
+    contentDescription: String,
+    onClick: () -> Unit,
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier.tap(onClick = onClick),
+    ) {
+        Icon(
+            icon,
+            contentDescription = contentDescription,
+            tint = MonoColors.Foreground,
+            modifier = Modifier.size(n(30)),
+        )
+        Spacer(Modifier.height(n(4)))
+        if (active) {
+            Box(
+                Modifier
+                    .size(n(5))
+                    .background(MonoColors.Foreground, CircleShape),
+            )
+        } else {
+            Spacer(Modifier.height(n(5)))
+        }
     }
 }

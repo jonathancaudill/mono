@@ -18,6 +18,10 @@ import com.lightphone.spotify.data.mapWebApiError
 import com.lightphone.spotify.data.local.LibraryRepository
 import com.lightphone.spotify.data.local.LikedTrackEntity
 import com.lightphone.spotify.data.local.MonoDatabase
+import com.lightphone.spotify.data.PlaylistDetailResult
+import com.lightphone.spotify.data.SpotifyPlaylistDetail
+import com.lightphone.spotify.data.SpotifyPlaylistSimple
+import com.lightphone.spotify.data.local.PlaylistEntity
 import com.lightphone.spotify.data.local.SavedAlbumEntity
 import com.lightphone.spotify.data.SpotifyRepository
 import com.lightphone.spotify.data.SearchResults
@@ -29,6 +33,7 @@ import com.lightphone.spotify.data.webapi.WebApiAuth
 import com.lightphone.spotify.ffi.NormalizationType
 import com.lightphone.spotify.ffi.PlayerEventListener
 import com.lightphone.spotify.ffi.SpotifyException
+import com.lightphone.spotify.ffi.RepeatMode
 import com.lightphone.spotify.ffi.StreamingQuality
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -41,6 +46,20 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import java.io.File
+
+data class QueueUiItem(
+    val uri: String,
+    val title: String,
+    val artists: String,
+    val durationMs: Long,
+)
+
+data class QueueViewState(
+    val nowPlaying: QueueUiItem? = null,
+    val nextInQueue: List<QueueUiItem> = emptyList(),
+    val contextLabel: String? = null,
+    val nextFromContext: List<QueueUiItem> = emptyList(),
+)
 
 data class PlaybackUiState(
     val loggedIn: Boolean = false,
@@ -59,6 +78,9 @@ data class PlaybackUiState(
     val artUrl: String? = null,
     val albumId: String? = null,
     val durationMs: Long = 0,
+    val shuffleEnabled: Boolean = false,
+    val repeatMode: RepeatMode = RepeatMode.OFF,
+    val queue: QueueViewState = QueueViewState(),
     val error: String? = null,
 )
 
@@ -265,7 +287,7 @@ class PlaybackController private constructor(
 
     // --- Transport ----------------------------------------------------------
 
-    fun play(tracks: List<TrackMetadata>, startIndex: Int) {
+    fun play(tracks: List<TrackMetadata>, startIndex: Int, contextLabel: String? = null) {
         tracks.forEach { trackMetadata[normalizeUri(it.uri)] = it }
         tracks.getOrNull(startIndex)?.let { track ->
             _state.update {
@@ -279,6 +301,8 @@ class PlaybackController private constructor(
                     isLoading = true,
                     isPlaying = true,
                     positionMs = 0,
+                    shuffleEnabled = false,
+                    repeatMode = RepeatMode.OFF,
                     error = null,
                 )
             }
@@ -293,7 +317,7 @@ class PlaybackController private constructor(
                 onStateChanged?.invoke()
                 return@launch
             }
-            runCatching { engine.playUris(uris, startIndex.toUInt()) }
+            runCatching { engine.playUris(uris, startIndex.toUInt(), contextLabel) }
                 .onSuccess {
                     android.util.Log.i("Playback", "playUris index=$startIndex uri=${uris.getOrNull(startIndex)}")
                     _state.update { it.copy(isPlaying = true, isLoading = true) }
@@ -332,10 +356,118 @@ class PlaybackController private constructor(
         }
     }
 
-    fun next() = scope.launch { engine.next() }
-    fun previous() = scope.launch { engine.previous() }
+    fun next() = scope.launch {
+        engine.next()
+        syncPlaybackModes()
+    }
+    fun previous() = scope.launch {
+        engine.previous()
+        syncPlaybackModes()
+    }
     fun seek(positionMs: Long) = scope.launch { engine.seek(positionMs.toUInt()) }
+    fun toggleShuffle() = scope.launch {
+        val enabled = engine.toggleShuffle()
+        _state.update { it.copy(shuffleEnabled = enabled) }
+        onStateChanged?.invoke()
+    }
+    fun toggleRepeat() = scope.launch {
+        val mode = engine.toggleRepeat()
+        _state.update { it.copy(repeatMode = mode) }
+        onStateChanged?.invoke()
+    }
     fun setVolume(percent: Int) = scope.launch { engine.setVolume(percent.coerceIn(0, 100).toUByte()) }
+
+    fun refreshQueue() {
+        val snapshot = engine.getQueue()
+        val queue = QueueViewState(
+            nowPlaying = snapshot.nowPlayingUri?.let { uriToQueueItem(normalizeUri(it)) },
+            nextInQueue = snapshot.nextInQueue.map { uriToQueueItem(normalizeUri(it)) },
+            contextLabel = snapshot.contextLabel,
+            nextFromContext = snapshot.nextFromContext.map { uriToQueueItem(normalizeUri(it)) },
+        )
+        _state.update { it.copy(queue = queue) }
+        onStateChanged?.invoke()
+        enrichQueueMetadata(queue.allUris())
+    }
+
+    private fun QueueViewState.allUris(): List<String> =
+        buildList {
+            nowPlaying?.uri?.let { add(it) }
+            addAll(nextInQueue.map { it.uri })
+            addAll(nextFromContext.map { it.uri })
+        }
+
+    private fun uriToQueueItem(uri: String): QueueUiItem {
+        val cached = trackMetadata[uri]
+        return QueueUiItem(
+            uri = uri,
+            title = cached?.title ?: "…",
+            artists = cached?.artists.orEmpty(),
+            durationMs = cached?.durationMs ?: 0L,
+        )
+    }
+
+    private fun enrichQueueMetadata(uris: List<String>) {
+        val missing = uris.filter { trackMetadata[it] == null }
+        if (missing.isEmpty()) return
+        scope.launch {
+            for (uri in missing) {
+                runCatching { repository.trackMetadataForUri(uri) }
+                    .onSuccess { meta ->
+                        if (meta != null) {
+                            trackMetadata[uri] = meta
+                            refreshQueue()
+                        }
+                    }
+            }
+        }
+    }
+
+    fun addToQueue(track: TrackMetadata) {
+        trackMetadata[normalizeUri(track.uri)] = track
+        val snapshot = engine.getQueue()
+        if (_state.value.currentUri == null && snapshot.nowPlayingUri == null) {
+            play(listOf(track), 0, track.album.ifBlank { track.title })
+            return
+        }
+        scope.launch {
+            runCatching { engine.addToQueue(normalizeUri(track.uri)) }
+                .onSuccess { refreshQueue() }
+                .onFailure { e ->
+                    android.util.Log.w("Playback", "addToQueue failed", e)
+                    _state.update { it.copy(error = e.message) }
+                }
+        }
+    }
+
+    fun clearManualQueue() = scope.launch {
+        engine.clearManualQueue()
+        refreshQueue()
+    }
+
+    fun moveQueueItemUp(index: Int) = scope.launch {
+        runCatching { engine.moveQueueItemUp(index.toUInt()) }
+            .onSuccess { refreshQueue() }
+            .onFailure { e -> android.util.Log.w("Playback", "moveQueueItemUp failed", e) }
+    }
+
+    fun moveQueueItemDown(index: Int) = scope.launch {
+        runCatching { engine.moveQueueItemDown(index.toUInt()) }
+            .onSuccess { refreshQueue() }
+            .onFailure { e -> android.util.Log.w("Playback", "moveQueueItemDown failed", e) }
+    }
+
+    fun moveContextItemUp(index: Int) = scope.launch {
+        runCatching { engine.moveContextItemUp(index.toUInt()) }
+            .onSuccess { refreshQueue() }
+            .onFailure { e -> android.util.Log.w("Playback", "moveContextItemUp failed", e) }
+    }
+
+    fun moveContextItemDown(index: Int) = scope.launch {
+        runCatching { engine.moveContextItemDown(index.toUInt()) }
+            .onSuccess { refreshQueue() }
+            .onFailure { e -> android.util.Log.w("Playback", "moveContextItemDown failed", e) }
+    }
 
     fun loadSettings(): SettingsSnapshot = SettingsSnapshot(
         streamingQuality = engine.getStreamingQuality(),
@@ -428,6 +560,97 @@ class PlaybackController private constructor(
     suspend fun likedTracksForPlayback(fromIndex: Int): List<TrackMetadata> =
         kotlinx.coroutines.withContext(Dispatchers.IO) {
             libraryRepository.likedTracksForPlayback(fromIndex)
+        }
+
+    fun playlistsUiFlow(): Flow<Triple<List<PlaylistEntity>, Int, Boolean>> =
+        libraryRepository.playlistsUiFlow()
+
+    suspend fun refreshPlaylists(): Boolean =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            libraryRepository.refreshPlaylists()
+        }
+
+    suspend fun playlistsNeedsFill(): Boolean =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            libraryRepository.playlistsNeedsFill()
+        }
+
+    suspend fun appendPlaylists(): Boolean =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            libraryRepository.appendPlaylists()
+        }
+
+    suspend fun fillRemainingPlaylists(): Int =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            libraryRepository.fillRemainingPlaylists()
+        }
+
+    suspend fun playlistDetail(playlistId: String): PlaylistDetailResult =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            try {
+                repository.playlistDetail(playlistId)
+            } catch (e: Throwable) {
+                android.util.Log.e("Library", "playlistDetail failed", e)
+                throw Exception(mapWebApiError(e))
+            }
+        }
+
+    suspend fun createPlaylist(name: String, isPublic: Boolean): SpotifyPlaylistSimple =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            try {
+                repository.createPlaylist(name, isPublic)
+            } catch (e: Throwable) {
+                throw Exception(mapWebApiError(e))
+            }
+        }
+
+    suspend fun renamePlaylist(playlistId: String, name: String): SpotifyPlaylistDetail =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            try {
+                repository.renamePlaylist(playlistId, name)
+            } catch (e: Throwable) {
+                throw Exception(mapWebApiError(e))
+            }
+        }
+
+    suspend fun addTrackToPlaylist(playlistId: String, uri: String): String? =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            try {
+                repository.addTrackToPlaylist(playlistId, uri)
+            } catch (e: Throwable) {
+                throw Exception(mapWebApiError(e))
+            }
+        }
+
+    suspend fun removeTrackFromPlaylist(playlistId: String, uri: String, snapshotId: String?): String? =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            try {
+                repository.removeTrackFromPlaylist(playlistId, uri, snapshotId)
+            } catch (e: Throwable) {
+                throw Exception(mapWebApiError(e))
+            }
+        }
+
+    suspend fun reorderPlaylistTrack(
+        playlistId: String,
+        fromIndex: Int,
+        toIndex: Int,
+        snapshotId: String?,
+    ): String? = kotlinx.coroutines.withContext(Dispatchers.IO) {
+        try {
+            repository.reorderPlaylistTrack(playlistId, fromIndex, toIndex, snapshotId)
+        } catch (e: Throwable) {
+            throw Exception(mapWebApiError(e))
+        }
+    }
+
+    suspend fun editablePlaylists(): List<PlaylistEntity> =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            try {
+                repository.editablePlaylists()
+            } catch (e: Throwable) {
+                throw Exception(mapWebApiError(e))
+            }
         }
 
     suspend fun albumDetail(albumId: String): AlbumDetailResult =
@@ -574,7 +797,9 @@ class PlaybackController private constructor(
     override fun onTrackChanged(uri: String) {
         val normalized = normalizeUri(uri)
         _state.update { it.copy(currentUri = normalized, isLoading = false, error = null) }
+        syncPlaybackModes()
         fetchMetadata(normalized)
+        refreshQueue()
         onStateChanged?.invoke()
     }
 
@@ -604,7 +829,7 @@ class PlaybackController private constructor(
     }
 
     override fun onUnavailable(uri: String) {
-        _state.update { it.copy(error = "Track unavailable") }
+        // Rust auto-advances the queue; avoid sticky error state.
     }
 
     override fun onConnectionLost() {
@@ -617,6 +842,10 @@ class PlaybackController private constructor(
 
     override fun onError(message: String) {
         _state.update { it.copy(error = message) }
+    }
+
+    override fun onQueueChanged() {
+        refreshQueue()
     }
 
     private fun fetchMetadata(uri: String) {
@@ -661,6 +890,15 @@ class PlaybackController private constructor(
             )
         }
         onStateChanged?.invoke()
+    }
+
+    private fun syncPlaybackModes() {
+        _state.update {
+            it.copy(
+                shuffleEnabled = engine.getShuffle(),
+                repeatMode = engine.getRepeatMode(),
+            )
+        }
     }
 
     private fun normalizeUri(uri: String): String = uri.substringBefore('?').trim()
