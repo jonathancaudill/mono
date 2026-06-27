@@ -18,8 +18,9 @@ import androidx.compose.ui.Modifier
 import com.lightphone.spotify.ui.components.buildLibraryDateIndex
 import com.lightphone.spotify.ui.AppViewModel
 import com.lightphone.spotify.ui.components.LibraryInfiniteList
-import com.lightphone.spotify.ui.components.MonoContentContainer
-import com.lightphone.spotify.ui.components.MonoMediaListItem
+import com.lightphone.spotify.ui.components.PhonoContentContainer
+import com.lightphone.spotify.ui.components.PhonoMediaListItem
+import com.lightphone.spotify.ui.components.ScrollbarMode
 import com.lightphone.spotify.ui.theme.n
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -40,7 +41,7 @@ fun AlbumsScreen(
         buildLibraryDateIndex(state.items) { it.added_at }
     }
 
-    MonoContentContainer(
+    PhonoContentContainer(
         title = "Albums",
         hideBackButton = true,
         rightIcon = Icons.Default.GraphicEq,
@@ -77,6 +78,7 @@ fun AlbumsScreen(
                         itemKey = { it.album_id },
                         onEnsureBufferAhead = vm::ensureSavedAlbumsBufferAhead,
                         dateIndex = dateIndex,
+                        scrollbarMode = ScrollbarMode.ScrubHoldOnly,
                         onScrubToIndex = { index -> vm.scrollSavedAlbumsToIndex(listState, index) },
                         onScrubJumpChange = { active ->
                             if (active) vm.onScrubJumpStart() else vm.onScrubJumpEnd()
@@ -85,7 +87,7 @@ fun AlbumsScreen(
                             .weight(1f)
                             .fillMaxWidth(),
                     ) { _, saved ->
-                        MonoMediaListItem(
+                        PhonoMediaListItem(
                             primaryText = saved.name,
                             secondaryText = saved.artist_names,
                             showImage = false,
