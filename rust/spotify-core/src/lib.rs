@@ -5,7 +5,8 @@
 //! and its sibling modules - never the Kotlin side.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use librespot::core::authentication::Credentials;
@@ -13,7 +14,9 @@ use librespot::core::cache::Cache;
 use librespot::core::config::SessionConfig;
 use librespot::core::spotify_id::SpotifyId;
 use librespot::core::{Session, SpotifyUri};
-use librespot::playback::config::AudioFormat;
+use librespot::metadata::audio::{AudioFileFormat, AudioItem};
+use librespot::audio::{AudioFile, Range};
+use librespot::playback::config::{AudioFormat, Bitrate};
 use librespot::playback::mixer::softmixer::SoftMixer;
 use librespot::playback::mixer::{Mixer, MixerConfig};
 use librespot::playback::player::{Player, PlayerEvent};
@@ -89,6 +92,8 @@ pub trait PlayerEventListener: Send + Sync {
     fn on_connection_restored(&self);
     fn on_error(&self, message: String);
     fn on_queue_changed(&self);
+    /// Emitted when decode stalls (buffer underrun) or resumes.
+    fn on_buffering(&self, stalled: bool);
 }
 
 type SharedListener = Arc<Mutex<Option<Box<dyn PlayerEventListener>>>>;
@@ -169,6 +174,22 @@ struct EngineShared {
     active: Mutex<Option<Active>>,
     oauth: Mutex<Option<OAuthState>>,
     refresh_mutex: Mutex<()>,
+    /// Whether the user intends playback to be running. Tracked across session
+    /// rebuilds so an idle-timeout reconnect restores the queue *paused* instead
+    /// of auto-starting music the user had paused. Survives `Active` swaps because
+    /// it lives on the long-lived `EngineShared`.
+    playing: Arc<AtomicBool>,
+    /// Queue held while `active` is dropped during reconnect so UI reads stay populated.
+    pending_queue: Mutex<Option<QueueState>>,
+    rebuild_mutex: Mutex<()>,
+    last_force_reconnect: Mutex<Option<Instant>>,
+    prefetch_generation: AtomicU32,
+    #[cfg(debug_assertions)]
+    metrics_transport_reconnect: AtomicU32,
+    #[cfg(debug_assertions)]
+    metrics_full_rebuild: AtomicU32,
+    #[cfg(debug_assertions)]
+    metrics_stall_events: AtomicU32,
 }
 
 /// The UniFFI object handed to Kotlin.
@@ -238,11 +259,13 @@ impl LibrespotEngine {
         start_index: u32,
         context_label: Option<String>,
     ) -> Result<(), SpotifyError> {
+        EngineShared::ensure_playback_ready(&self.shared)?;
         self.shared.play_uris(uris, start_index, context_label)
     }
 
     /// Convenience: play a single URI.
     pub fn play_uri(&self, uri: String) -> Result<(), SpotifyError> {
+        EngineShared::ensure_playback_ready(&self.shared)?;
         self.shared.play_uris(vec![uri], 0, None)
     }
 
@@ -251,18 +274,22 @@ impl LibrespotEngine {
     }
 
     pub fn resume(&self) {
+        let _ = EngineShared::ensure_playback_ready(&self.shared);
         self.shared.transport_resume();
     }
 
     pub fn next(&self) {
+        let _ = EngineShared::ensure_playback_ready(&self.shared);
         self.shared.transport_next();
     }
 
     pub fn previous(&self) {
+        let _ = EngineShared::ensure_playback_ready(&self.shared);
         self.shared.transport_previous();
     }
 
     pub fn seek(&self, position_ms: u32) {
+        let _ = EngineShared::ensure_playback_ready(&self.shared);
         self.shared.transport_seek(position_ms);
     }
 
@@ -400,6 +427,38 @@ impl LibrespotEngine {
         self.shared.logout();
     }
 
+    /// Proactively invalidate the session after a network change so reconnect
+    /// starts on the new transport instead of waiting for keepalive timeout.
+    pub fn force_reconnect_check(&self) {
+        self.shared.force_reconnect_check();
+    }
+
+    /// Bank the currently playing track to its end (opportunistic full-track cache).
+    pub fn buffer_current_to_end(&self) {
+        self.shared.with_active(|a| a.player.buffer_current_to_end());
+    }
+
+    /// True when the active track is fully present in the local audio cache.
+    pub fn is_current_fully_buffered(&self) -> bool {
+        self.shared
+            .active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|a| a.player.is_current_fully_buffered())
+            .unwrap_or(false)
+    }
+
+    /// Prefetch up to `ahead` upcoming queue tracks into the shared audio cache.
+    pub fn prefetch_upcoming(&self, ahead: u32) {
+        self.shared.prefetch_upcoming(ahead);
+    }
+
+    /// Ensure session + player are ready for transport commands (rebuild if needed).
+    pub fn ensure_playback_ready(&self) -> Result<(), SpotifyError> {
+        EngineShared::ensure_playback_ready(&self.shared)
+    }
+
     /// Rebuild session + player so persisted settings take effect mid-session.
     fn rebuild_player_if_active(&self) {
         if self.shared.active.lock().unwrap().is_none() {
@@ -467,6 +526,7 @@ impl EngineShared {
         session_config.client_id = auth::CLIENT_ID.to_string();
         session_config.device_id = load_or_create_device_id(&base);
         session_config.tmp_dir = tmp_dir.clone();
+        session_config.autoplay = Some(false);
 
         if let Some(ref proxy) = settings.get().proxy {
             if let Ok(url) = proxy.parse() {
@@ -487,6 +547,17 @@ impl EngineShared {
             active: Mutex::new(None),
             oauth: Mutex::new(None),
             refresh_mutex: Mutex::new(()),
+            playing: Arc::new(AtomicBool::new(false)),
+            pending_queue: Mutex::new(None),
+            rebuild_mutex: Mutex::new(()),
+            last_force_reconnect: Mutex::new(None),
+            prefetch_generation: AtomicU32::new(0),
+            #[cfg(debug_assertions)]
+            metrics_transport_reconnect: AtomicU32::new(0),
+            #[cfg(debug_assertions)]
+            metrics_full_rebuild: AtomicU32::new(0),
+            #[cfg(debug_assertions)]
+            metrics_stall_events: AtomicU32::new(0),
         }))
     }
 
@@ -697,12 +768,55 @@ impl EngineShared {
     }
 
     fn is_logged_in(&self) -> bool {
-        self.active
+        if self
+            .active
             .lock()
             .unwrap()
             .as_ref()
             .map(|a| !a.session.is_invalid())
             .unwrap_or(false)
+        {
+            return true;
+        }
+        self.cache.credentials().is_some()
+            && self.pending_queue.lock().unwrap().is_some()
+    }
+
+    fn ensure_playback_ready(shared: &Arc<Self>) -> Result<(), SpotifyError> {
+        if shared
+            .active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|a| !a.session.is_invalid())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let _guard = shared.rebuild_mutex.lock().unwrap();
+        if shared
+            .active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|a| !a.session.is_invalid())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let resume = shared
+            .pending_queue
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| shared.snapshot_resume());
+        let creds = shared
+            .cache
+            .credentials()
+            .ok_or(SpotifyError::NotLoggedIn)?;
+        let handle = shared.runtime.handle().clone();
+        handle.block_on(shared.clone().build_active(creds, resume))?;
+        Ok(())
     }
 
     /// A Spotify Web API access token. Returns the cached OAuth token while it is
@@ -885,6 +999,7 @@ impl EngineShared {
             (active.player.clone(), uri)
         };
 
+        self.playing.store(true, Ordering::SeqCst);
         player.load(uri, true, 0);
         self.notify_queue_changed();
         Ok(())
@@ -979,10 +1094,12 @@ impl EngineShared {
     }
 
     fn transport_pause(&self) {
+        self.playing.store(false, Ordering::SeqCst);
         self.with_active(|a| a.player.pause());
     }
 
     fn transport_resume(&self) {
+        self.playing.store(true, Ordering::SeqCst);
         self.with_active(|a| a.player.play());
     }
 
@@ -1051,6 +1168,8 @@ impl EngineShared {
         let guard = self.active.lock().unwrap();
         if let Some(active) = guard.as_ref() {
             f(&active.queue.lock().unwrap())
+        } else if let Some(pending) = self.pending_queue.lock().unwrap().as_ref() {
+            f(pending)
         } else {
             f(&QueueState::default())
         }
@@ -1059,6 +1178,8 @@ impl EngineShared {
     fn with_active_queue_mut<F: FnOnce(&mut QueueState)>(&self, f: F) {
         if let Some(active) = self.active.lock().unwrap().as_ref() {
             f(&mut active.queue.lock().unwrap());
+        } else if let Some(pending) = self.pending_queue.lock().unwrap().as_mut() {
+            f(pending);
         }
     }
 
@@ -1078,7 +1199,7 @@ impl EngineShared {
     async fn build_active(
         self: Arc<Self>,
         credentials: Credentials,
-        resume: Option<(Vec<SpotifyUri>, usize, u32)>,
+        resume: Option<QueueState>,
     ) -> Result<(), SpotifyError> {
         let session_config = self.session_config.lock().unwrap().clone();
         let session = Session::new(session_config, Some(self.cache.clone()));
@@ -1111,16 +1232,19 @@ impl EngineShared {
         mixer.set_volume(u16::MAX);
 
         let queue = Arc::new(Mutex::new(QueueState::default()));
-        if let Some((uris, uri_index, position_ms)) = resume {
-            queue.lock().unwrap().restore_linear(uris, uri_index, position_ms);
+        if let Some(snap) = resume {
+            queue.lock().unwrap().restore_snapshot(snap);
         }
 
         let rx = player.get_player_event_channel();
+        let weak = Arc::downgrade(&self);
         let event_task = self.runtime.spawn(forward_events(
             rx,
             player.clone(),
             queue.clone(),
             self.listener.clone(),
+            self.playing.clone(),
+            weak,
         ));
 
         spawn_monitor(
@@ -1134,7 +1258,13 @@ impl EngineShared {
             q.current_uri()
         } {
             let pos = queue.lock().unwrap().position_ms();
-            player.load(uri, true, pos);
+            // Only auto-start if the user actually had playback running. An
+            // idle-timeout reconnect of a paused queue must restore it paused.
+            let start_playing = self.playing.load(Ordering::SeqCst);
+            log::info!(
+                "build_active: uri={uri} pos={pos} start_playing={start_playing} reason=session_rebuild"
+            );
+            player.load(uri, start_playing, pos);
         }
 
         *self.active.lock().unwrap() = Some(Active {
@@ -1144,15 +1274,69 @@ impl EngineShared {
             queue,
             event_task,
         });
+        *self.pending_queue.lock().unwrap() = None;
+        self.notify_queue_changed();
         Ok(())
     }
 
-    fn snapshot_resume(&self) -> Option<(Vec<SpotifyUri>, usize, u32)> {
+    fn snapshot_resume(&self) -> Option<QueueState> {
         self.active
             .lock()
             .unwrap()
             .as_ref()
             .and_then(|a| a.queue.lock().unwrap().snapshot_resume())
+    }
+
+    fn prefetch_upcoming(&self, ahead: u32) {
+        let ahead = ahead.min(3);
+        if ahead == 0 {
+            return;
+        }
+        let (session, upcoming, bitrate, generation) = {
+            let guard = self.active.lock().unwrap();
+            let Some(active) = guard.as_ref() else {
+                return;
+            };
+            let upcoming = active
+                .queue
+                .lock()
+                .unwrap()
+                .upcoming_prefetch_uris(ahead as usize);
+            if upcoming.is_empty() {
+                return;
+            }
+            (
+                active.session.clone(),
+                upcoming,
+                self.settings.get().player_config().bitrate,
+                self.prefetch_generation.fetch_add(1, Ordering::SeqCst) + 1,
+            )
+        };
+        self.runtime.spawn(async move {
+            for uri in upcoming {
+                prefetch_track(&session, uri, bitrate).await;
+            }
+            let _ = generation;
+        });
+    }
+
+    fn force_reconnect_check(&self) {
+        let now = Instant::now();
+        {
+            let mut last = self.last_force_reconnect.lock().unwrap();
+            if let Some(prev) = *last {
+                if now.duration_since(prev) < Duration::from_secs(5) {
+                    return;
+                }
+            }
+            *last = Some(now);
+        }
+        if let Some(active) = self.active.lock().unwrap().as_ref() {
+            if active.session.is_invalid() {
+                return;
+            }
+            active.session.shutdown();
+        }
     }
 }
 
@@ -1180,6 +1364,7 @@ fn spawn_monitor(
             notify(&shared.listener, |l| l.on_connection_lost());
 
             let resume = shared.snapshot_resume();
+            *shared.pending_queue.lock().unwrap() = resume.clone();
             *shared.active.lock().unwrap() = None;
 
             let mut delay = 2u64;
@@ -1243,6 +1428,8 @@ async fn forward_events(
     player: Arc<Player>,
     queue: Arc<Mutex<QueueState>>,
     listener: SharedListener,
+    playing: Arc<AtomicBool>,
+    weak: Weak<EngineShared>,
 ) {
     let mut unavailable_guard = UnavailableGuard::new();
     while let Some(event) = rx.recv().await {
@@ -1254,10 +1441,12 @@ async fn forward_events(
             }
             PlayerEvent::Playing { track_id, position_ms, .. } => {
                 unavailable_guard.reset();
+                playing.store(true, Ordering::SeqCst);
                 notify(&listener, |l| l.on_playing(position_ms as i64));
                 notify(&listener, |l| l.on_track_changed(uri_to_string(&track_id)));
             }
             PlayerEvent::Paused { position_ms, .. } => {
+                playing.store(false, Ordering::SeqCst);
                 notify(&listener, |l| l.on_paused(position_ms as i64));
             }
             PlayerEvent::PositionChanged { position_ms, .. }
@@ -1274,18 +1463,31 @@ async fn forward_events(
                 if unavailable_guard.record() {
                     log::warn!("too many consecutive unavailable tracks; stopping playback");
                     unavailable_guard.reset();
+                    playing.store(false, Ordering::SeqCst);
                     notify(&listener, |l| l.on_end_of_track());
                 } else {
                     let next = queue.lock().unwrap().skip_next(false);
                     if let Some(uri) = next {
                         player.load(uri, true, 0);
                     } else {
+                        playing.store(false, Ordering::SeqCst);
                         notify(&listener, |l| l.on_end_of_track());
                     }
                 }
             }
             PlayerEvent::Stopped { track_id, .. } => {
                 log::warn!("playback stopped for {}", uri_to_string(&track_id));
+                if playing.load(Ordering::SeqCst) {
+                    if let Some(shared) = weak.upgrade() {
+                        #[cfg(debug_assertions)]
+                        shared
+                            .metrics_stall_events
+                            .fetch_add(1, Ordering::SeqCst);
+                        std::thread::spawn(move || {
+                            let _ = EngineShared::ensure_playback_ready(&shared);
+                        });
+                    }
+                }
             }
             PlayerEvent::TimeToPreloadNextTrack { .. } => {
                 if let Some(uri) = queue.lock().unwrap().next_preload_uri() {
@@ -1297,6 +1499,7 @@ async fn forward_events(
                 if let Some(uri) = next {
                     player.load(uri, true, 0);
                 } else {
+                    playing.store(false, Ordering::SeqCst);
                     notify(&listener, |l| l.on_end_of_track());
                 }
             }
@@ -1340,6 +1543,88 @@ fn parse_uri(input: &str) -> Result<SpotifyUri, SpotifyError> {
 
 fn uri_to_string(uri: &SpotifyUri) -> String {
     uri.to_uri().unwrap_or_default()
+}
+
+fn preferred_formats(bitrate: Bitrate) -> &'static [AudioFileFormat] {
+    use AudioFileFormat::*;
+    match bitrate {
+        Bitrate::Bitrate96 => &[OGG_VORBIS_96, OGG_VORBIS_160, OGG_VORBIS_320],
+        Bitrate::Bitrate160 => &[OGG_VORBIS_160, OGG_VORBIS_96, OGG_VORBIS_320],
+        Bitrate::Bitrate320 => &[OGG_VORBIS_320, OGG_VORBIS_160, OGG_VORBIS_96],
+    }
+}
+
+fn bytes_per_second(format: AudioFileFormat) -> usize {
+    use AudioFileFormat::*;
+    let kbps: f32 = match format {
+        OGG_VORBIS_96 => 12.,
+        OGG_VORBIS_160 => 20.,
+        OGG_VORBIS_320 => 40.,
+        MP3_256 => 32.,
+        MP3_320 => 40.,
+        MP3_160 => 20.,
+        MP3_96 => 12.,
+        MP3_160_ENC => 20.,
+        AAC_24 => 3.,
+        AAC_48 => 6.,
+        AAC_160 => 20.,
+        AAC_320 => 40.,
+        MP4_128 => 16.,
+        OTHER5 => 40.,
+        FLAC_FLAC => 112.,
+        XHE_AAC_12 => 1.5,
+        XHE_AAC_16 => 2.,
+        XHE_AAC_24 => 3.,
+        FLAC_FLAC_24BIT => 3.,
+    };
+    (kbps * 1024.).ceil() as usize
+}
+
+async fn resolve_playable_file(
+    session: &Session,
+    uri: SpotifyUri,
+    bitrate: Bitrate,
+) -> Option<(librespot::core::FileId, usize)> {
+    let mut item = AudioItem::get_file(session, uri).await.ok()?;
+    if item.files.is_empty() {
+        if let Some(alts) = item.alternatives.clone() {
+            for alt in alts.0 {
+                if let Ok(alt_item) = AudioItem::get_file(session, alt).await {
+                    if !alt_item.files.is_empty() {
+                        item = alt_item;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    for &fmt in preferred_formats(bitrate) {
+        if let Some(&file_id) = item.files.get(&fmt) {
+            return Some((file_id, bytes_per_second(fmt)));
+        }
+    }
+    None
+}
+
+async fn prefetch_track(session: &Session, uri: SpotifyUri, bitrate: Bitrate) {
+    let Some((file_id, bps)) = resolve_playable_file(session, uri, bitrate).await else {
+        return;
+    };
+    match AudioFile::open(session, file_id, bps).await {
+        Ok(file) => {
+            if let Ok(slc) = file.get_stream_loader_controller() {
+                if slc.range_to_end_available() {
+                    return;
+                }
+                slc.set_random_access_mode();
+                let len = slc.len();
+                if len > 0 {
+                    slc.fetch(Range::new(0, len));
+                }
+            }
+        }
+        Err(e) => log::debug!("prefetch open failed for {file_id}: {e}"),
+    }
 }
 
 fn load_or_create_device_id(base: &Path) -> String {
@@ -1499,4 +1784,145 @@ fn album_cover_url(covers: &librespot::metadata::image::Images) -> Option<String
         .iter()
         .max_by_key(|c| c.width)
         .map(|c| format!("https://i.scdn.co/image/{}", c.id))
+}
+
+/// Tests that simulate long-running sessions and background use without a live
+/// Spotify connection. They exercise the pure state machines that govern how the
+/// app behaves over hours of playback, across token expiry, and across the
+/// reconnect/rebuild that happens when the OS backgrounds (and later wakes) us.
+#[cfg(test)]
+mod long_running_tests {
+    use super::*;
+
+    fn oauth_state(access_token: &str, issued_secs_ago: u64, ttl_secs: u64) -> OAuthState {
+        let issued_at = Instant::now() - Duration::from_secs(issued_secs_ago);
+        // `expires_at` mirrors `store_oauth`: nominal expiry minus the early-refresh window.
+        let expires_at = issued_at + Duration::from_secs(ttl_secs.saturating_sub(REFRESH_EARLY_SECS).max(1));
+        OAuthState {
+            access_token: access_token.to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            expires_at,
+            issued_at,
+            token_ttl_secs: ttl_secs,
+            last_refresh_fail: None,
+        }
+    }
+
+    /// A token that has just expired (but is well within the stale-grace window)
+    /// must keep working. This is the common case when the app has been
+    /// backgrounded for ~an hour and wakes up needing metadata before a refresh
+    /// round-trip completes.
+    #[test]
+    fn freshly_expired_token_is_usable_within_grace() {
+        let ttl = 3600;
+        // Issued just past nominal expiry: token is "expired" but inside grace.
+        let state = oauth_state("valid-token", ttl + 10, ttl);
+        let now = Instant::now();
+        assert!(state.within_stale_grace(now));
+    }
+
+    /// Once the full TTL + grace window elapses, a stale token is no longer
+    /// usable and the engine must force a real refresh / re-login. Prevents the
+    /// app from clinging to a long-dead token after days in the background.
+    #[test]
+    fn token_past_grace_window_is_not_usable() {
+        let ttl = 3600;
+        let state = oauth_state("expired-token", ttl + STALE_GRACE_SECS + 30, ttl);
+        let now = Instant::now();
+        assert!(!state.within_stale_grace(now));
+    }
+
+    /// An empty access token (e.g. session restored from a refresh token only,
+    /// before the first refresh) is never treated as a usable stale token.
+    #[test]
+    fn empty_token_is_never_within_grace() {
+        let ttl = 3600;
+        let state = oauth_state("", 5, ttl);
+        let now = Instant::now();
+        assert!(!state.within_stale_grace(now));
+    }
+
+    /// The grace countdown surfaced to the spclient fallback must never drop
+    /// below a 60s floor, so a near-deadline token still buys a usable window.
+    #[test]
+    fn remaining_grace_has_minimum_floor() {
+        let ttl = 3600;
+        // Almost at the grace deadline: raw remaining would be ~10s.
+        let state = oauth_state("valid-token", ttl + STALE_GRACE_SECS - 10, ttl);
+        let now = Instant::now();
+        assert!(state.within_stale_grace(now));
+        assert_eq!(state.remaining_grace_secs(now), 60);
+    }
+
+    /// A long-lived token reports a large remaining grace, not the floor.
+    #[test]
+    fn remaining_grace_reflects_real_window_when_large() {
+        let ttl = 3600;
+        let state = oauth_state("valid-token", 10, ttl);
+        let now = Instant::now();
+        let remaining = state.remaining_grace_secs(now);
+        // ~ ttl - 10 + STALE_GRACE_SECS, comfortably above the floor.
+        assert!(remaining > 3000, "expected large grace window, got {remaining}");
+    }
+
+    /// The OAuth cache persisted to disk (so a backgrounded-then-killed process
+    /// can restore metadata access on relaunch) must round-trip exactly.
+    #[test]
+    fn persisted_oauth_cache_round_trips() {
+        let cache = PersistedOAuthCache {
+            access_token: "cached-access-token".to_string(),
+            expires_at_epoch_secs: 1_900_000_000,
+            token_ttl_secs: 3600,
+        };
+        let json = serde_json::to_string(&cache).unwrap();
+        let restored: PersistedOAuthCache = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.access_token, cache.access_token);
+        assert_eq!(restored.expires_at_epoch_secs, cache.expires_at_epoch_secs);
+        assert_eq!(restored.token_ttl_secs, cache.token_ttl_secs);
+    }
+
+    /// During long playback, a handful of consecutive unavailable tracks should
+    /// auto-skip; only a burst within the short window should stop playback so
+    /// the app doesn't sit silently dead in the user's pocket.
+    #[test]
+    fn unavailable_guard_stops_only_after_burst() {
+        let mut guard = UnavailableGuard::new();
+        // Four quick failures: keep skipping.
+        for _ in 0..4 {
+            assert!(!guard.record());
+        }
+        // Fifth within the window: stop.
+        assert!(guard.record());
+    }
+
+    /// A successful track between failures resets the counter, so isolated dead
+    /// tracks spread across a long listening session never accumulate to a stop.
+    #[test]
+    fn unavailable_guard_resets_between_good_tracks() {
+        let mut guard = UnavailableGuard::new();
+        for _ in 0..4 {
+            assert!(!guard.record());
+        }
+        guard.reset();
+        // Counter cleared: another four failures still don't trip the stop.
+        for _ in 0..4 {
+            assert!(!guard.record());
+        }
+    }
+
+    /// Failures spaced further apart than the 10s window must not accumulate:
+    /// the window rolls forward and the count restarts. Simulates rare dead
+    /// tracks encountered over hours rather than a broken-connection burst.
+    #[test]
+    fn unavailable_guard_window_rolls_over_time() {
+        let mut guard = UnavailableGuard::new();
+        for _ in 0..4 {
+            assert!(!guard.record());
+        }
+        // Simulate >10s elapsing since the window opened.
+        guard.window_start = Instant::now() - Duration::from_secs(11);
+        // This record falls in a new window, so it resets instead of tripping.
+        assert!(!guard.record());
+        assert_eq!(guard.count, 1);
+    }
 }

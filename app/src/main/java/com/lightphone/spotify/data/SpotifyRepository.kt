@@ -1,5 +1,6 @@
 package com.lightphone.spotify.data
 
+import com.lightphone.spotify.data.local.DetailCacheRepository
 import com.lightphone.spotify.data.local.LibraryRepository
 import com.lightphone.spotify.data.SpotifyPlaylistDetail
 import com.lightphone.spotify.data.SpotifyPlaylistSimple
@@ -47,16 +48,38 @@ data class PlaylistDetailResult(
 class SpotifyRepository(
     private val webApi: SpotifyWebApi,
     private val libraryRepository: LibraryRepository,
+    private val detailCache: DetailCacheRepository,
 ) {
     private val searchCache = ConcurrentHashMap<String, Pair<Long, SearchResults>>()
+    private val ephemeralAlbumCache = ConcurrentHashMap<String, EphemeralEntry<AlbumDetailResult>>()
+    private val ephemeralPlaylistCache = ConcurrentHashMap<String, EphemeralEntry<PlaylistDetailResult>>()
     private var dailyMixesCache: Pair<Long, List<SpotifyPlaylistSimple>>? = null
     private var currentUserIdCache: String? = null
 
-    fun albumDetail(albumId: String): AlbumDetailResult {
+    suspend fun albumDetail(albumId: String): AlbumDetailResult {
+        val now = System.currentTimeMillis()
+        ephemeralAlbumCache[albumId]?.let { entry ->
+            if (now - entry.at < CACHE_TTL_MS) {
+                entry.touch(now)
+                return entry.value
+            }
+            ephemeralAlbumCache.remove(albumId)
+        }
+        detailCache.getPinnedAlbumDetail(albumId)?.let { (album, isSaved) ->
+            return AlbumDetailResult(album = album, isSaved = isSaved)
+        }
+
         val album = webApi.album(albumId)
         val uri = album.uri.ifBlank { "spotify:album:$albumId" }
-        val isSaved = webApi.libraryContains(listOf(uri)).firstOrNull() ?: false
-        return AlbumDetailResult(album = album, isSaved = isSaved)
+        val isSaved = webApi.libraryContains(listOf(uri)).firstOrNull()
+            ?: detailCache.isSavedAlbumCached(albumId)
+        val result = AlbumDetailResult(album = album, isSaved = isSaved)
+        if (detailCache.isSavedAlbumCached(albumId)) {
+            detailCache.putPinnedAlbumDetail(albumId, album, isSaved)
+        } else {
+            putEphemeralAlbum(albumId, result, now)
+        }
+        return result
     }
 
     fun artistDetail(artistId: String): ArtistDetailResult {
@@ -92,24 +115,72 @@ class SpotifyRepository(
         return id
     }
 
-    fun playlistDetail(playlistId: String, trackLimit: Int = 500): PlaylistDetailResult {
-        val userId = currentUserId()
+    suspend fun playlistDetail(playlistId: String, trackLimit: Int = 500): PlaylistDetailResult {
+        val now = System.currentTimeMillis()
+        ephemeralPlaylistCache[playlistId]?.let { entry ->
+            if (now - entry.at < CACHE_TTL_MS) {
+                entry.touch(now)
+                return entry.value
+            }
+            ephemeralPlaylistCache.remove(playlistId)
+        }
+        detailCache.getPinnedPlaylistDetail(playlistId)?.let { (detail, tracks, _) ->
+            val userId = currentUserIdSuspend()
+            val isEditable = detail.owner?.id == userId || detail.collaborative
+            val uri = detail.uri.ifBlank { "spotify:playlist:$playlistId" }
+            val isInLibrary = webApi.libraryContains(listOf(uri)).firstOrNull() ?: false
+            return PlaylistDetailResult(
+                detail = detail,
+                tracks = tracks,
+                currentUserId = userId,
+                isEditable = isEditable,
+                isInLibrary = isInLibrary,
+            )
+        }
+
+        val userId = currentUserIdSuspend()
         val detail = webApi.playlist(playlistId)
         val tracks = paginatePlaylistTrackItems(playlistId, trackLimit)
         val isEditable = detail.owner?.id == userId || detail.collaborative
         val uri = detail.uri.ifBlank { "spotify:playlist:$playlistId" }
         val isInLibrary = webApi.libraryContains(listOf(uri)).firstOrNull() ?: false
-        return PlaylistDetailResult(
+        val result = PlaylistDetailResult(
             detail = detail,
             tracks = tracks,
             currentUserId = userId,
             isEditable = isEditable,
             isInLibrary = isInLibrary,
         )
+        if (detailCache.isUserPlaylist(playlistId)) {
+            detailCache.putPinnedPlaylistDetail(playlistId, detail, tracks, detail.snapshotId)
+        } else {
+            putEphemeralPlaylist(playlistId, result, now)
+        }
+        return result
     }
 
+    suspend fun playlistsContainingTrack(
+        trackUri: String,
+        playlistIds: List<String>,
+    ): Set<String> {
+        val normalized = normalizeUri(trackUri)
+        val found = mutableSetOf<String>()
+        for (playlistId in playlistIds) {
+            when {
+                detailCache.playlistContainsTrack(playlistId, normalized) -> found.add(playlistId)
+                ephemeralPlaylistCache[playlistId]?.value?.tracks?.any { item ->
+                    item.track?.uri?.let { normalizeUri(it) } == normalized
+                } == true -> found.add(playlistId)
+            }
+        }
+        return found
+    }
+
+    suspend fun isSavedAlbumCached(albumId: String): Boolean =
+        detailCache.isSavedAlbumCached(albumId)
+
     suspend fun createPlaylist(name: String, isPublic: Boolean): SpotifyPlaylistSimple {
-        val userId = currentUserId()
+        val userId = currentUserIdSuspend()
         val created = webApi.createPlaylist(userId, name.trim(), isPublic)
         libraryRepository.prependPlaylist(created)
         return created
@@ -159,20 +230,25 @@ class SpotifyRepository(
         libraryRepository.removePlaylist(playlistId)
     }
 
-    suspend fun editablePlaylists(): List<PlaylistEntity> {
-        val userId = currentUserId()
+    suspend fun editablePlaylists(userId: String? = null): List<PlaylistEntity> {
+        val resolvedUserId = userId ?: currentUserIdSuspend()
         return libraryRepository.playlistsSnapshot().filter { playlist ->
-            playlist.owner_id == userId || playlist.is_collaborative
+            playlist.owner_id == resolvedUserId || playlist.is_collaborative
         }
     }
 
-    private fun paginatePlaylistTrackItems(playlistId: String, limit: Int): List<SpotifyPlaylistTrackItem> {
+    suspend fun currentUserIdSuspend(): String {
+        currentUserIdCache?.let { return it }
+        val id = webApi.currentUserSuspend().id
+        currentUserIdCache = id
+        return id
+    }
+
+    private suspend fun paginatePlaylistTrackItems(playlistId: String, limit: Int): List<SpotifyPlaylistTrackItem> {
         val results = mutableListOf<SpotifyPlaylistTrackItem>()
         var offset = 0
         while (results.size < limit) {
-            val page = kotlinx.coroutines.runBlocking {
-                webApi.playlistItemsPage(playlistId, offset)
-            }
+            val page = webApi.playlistItemsPage(playlistId, offset)
             if (page.items.isEmpty()) break
             results.addAll(page.items)
             offset += page.items.size
@@ -252,8 +328,39 @@ class SpotifyRepository(
         libraryRepository.clearAll()
     }
 
+    private data class EphemeralEntry<T>(
+        val value: T,
+        var at: Long,
+        var lastAccessedAt: Long,
+    ) {
+        fun touch(now: Long) {
+            lastAccessedAt = now
+        }
+    }
+
+    private fun putEphemeralAlbum(albumId: String, result: AlbumDetailResult, now: Long) {
+        evictOldestIfNeeded(ephemeralAlbumCache, EPHEMERAL_ALBUM_CAP)
+        ephemeralAlbumCache[albumId] = EphemeralEntry(result, now, now)
+    }
+
+    private fun putEphemeralPlaylist(playlistId: String, result: PlaylistDetailResult, now: Long) {
+        evictOldestIfNeeded(ephemeralPlaylistCache, EPHEMERAL_PLAYLIST_CAP)
+        ephemeralPlaylistCache[playlistId] = EphemeralEntry(result, now, now)
+    }
+
+    private fun <T> evictOldestIfNeeded(
+        cache: ConcurrentHashMap<String, EphemeralEntry<T>>,
+        cap: Int,
+    ) {
+        if (cache.size < cap) return
+        val oldest = cache.entries.minByOrNull { it.value.lastAccessedAt }?.key ?: return
+        cache.remove(oldest)
+    }
+
     companion object {
         private const val CACHE_TTL_MS = 5 * 60_000L
+        private const val EPHEMERAL_ALBUM_CAP = 20
+        private const val EPHEMERAL_PLAYLIST_CAP = 10
     }
 
     private fun normalizeUri(uri: String): String = uri.substringBefore('?').trim()
